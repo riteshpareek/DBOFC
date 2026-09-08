@@ -4,7 +4,12 @@ Reviewed against a live **MariaDB 10.11.19** instance (Docker), running the fixt
 every concrete case in `03-Test-Plan.sql`.
 
 > **Status:** all findings (F1–F10) are **fixed** in `02-Implementation.sql` and
-> re-verified — see each finding for the change and its test.
+> re-verified — see each finding for the change and its test. A second-pass review after
+> the fixes is in the "Post-fix review" section below (F11–F17); F11 and F12 fixed, the
+> rest are doc-accuracy notes.
+>
+> The whole plan runs as 49 assertions via `bash test/run-all.sh` (drops the schema,
+> reloads `02-Implementation.sql`, exercises Tests 1–15) — currently **49/49 pass**.
 
 ## Test results at a glance
 
@@ -379,3 +384,48 @@ All ten findings are fixed in `02-Implementation.sql` and re-verified against Ma
 
 Remaining non-blocking note: the `UPDATE … JOIN … LIMIT` batching is MariaDB-only (see
 Portability note) — a comment now flags it in the source.
+
+---
+
+## Post-fix review (F11–F17)
+
+A second pass over the post-fix `02-Implementation.sql` against the (updated) design.
+All 15 tests / 49 assertions in `test/run-all.sh` pass on a virgin load.
+
+### F11 — reference joins relied on collation, contradicting §C  *(medium)* — **FIXED**
+
+> Design §C claims email matching does not depend on the schema's default collation. In
+> fact only `fn_generate_obfuscated_email()` lowercased (its hash input); the joins from a
+> user-reference column back to `UserObfuscationMapping` used plain `= t.<col>`, i.e. they
+> *did* depend on collation. Under `utf8mb4_general_ci` (the tested default) a case-variant
+> reference value resolved fine; under a `*_bin` / `*_cs` collation it would be treated as
+> an orphan and could get a divergent obfuscated value, breaking the "same user" link.
+>
+> **Fix:** `UserObfuscationMapping.OriginalUserID` is now stored `LOWER()`-cased, and every
+> reference join is `m.OriginalUserID = LOWER(t.<col>)` (function only on the scanned
+> side, so the mapping PK stays usable). `sp_create_user_mapping()` first `SIGNAL`s if
+> `dap_User` has rows differing only by `UserID` letter case (possible only under a
+> case-sensitive collation; merging two real users is worse than a hard stop). Verified
+> (Test 15): a `JOHN@TEST.COM` reference value links to `john@test.com`'s obfuscated id with
+> no spurious mapping row; under `utf8mb4_bin`, case-only duplicates raise 45000.
+
+### F12 — `ObfuscationRun` ordered by second-precision `DATETIME`  *(low)* — **FIXED**
+
+> `sp_obfuscation_status()` (and callers) pick "the last run" with
+> `ORDER BY StartedAt DESC LIMIT 1`. `StartedAt` was `DATETIME` (1 s), so two runs in the
+> same second — routine in a test loop, possible on a fast box — tiebreak arbitrarily and
+> the status proc could report the wrong run's outcome.
+> **Fix:** `StartedAt` / `FinishedAt` are now `DATETIME(6)`; `sp_obfuscation_prune()`
+> already pruned by RunID set, not timestamp.
+
+### F13–F17 — doc-accuracy notes (no code change)
+
+| # | Where | Note |
+|---|---|---|
+| F13 | §C "Large tables" | Batching is described as "a `LIMIT`-based loop keyed on primary key". `sp_obfuscate_user_references` uses `UPDATE … JOIN … LIMIT n` with no key/`ORDER BY`; it terminates because the `WHERE col <> obfuscated` set shrinks each pass (verified), but it is not PK-keyed. Reword, or add an `ORDER BY <pk>` for a strict keyset walk. |
+| F14 | §C "Duplicate names" | Formula given as `CRC32(SHA2(CONCAT(salt, key)))`; impl is `CRC32(SHA2(CONCAT('fname\|', key))) MOD n` — no explicit salt. Salt-dependence is transitive (the key is the already-salted obfuscated `UserID` in the orchestrated flow). Imprecise wording only. |
+| F15 | §A "Why dynamic SQL" | The "validate every `(table,column)` exists before building a statement" belt-and-braces covers `ObfuscationConfig` (via `sp_validate_config`) but not a hand-inserted `MANUAL` `UserReferenceRegistry` row — a bad one fails at `EXECUTE`, not up front. Add an existence check to `sp_discover_user_references` / a pre-flight over the registry. |
+| F16 | impl (minor) | Residual `ADDRESS` check does `SyntheticStreetAddress.AddressValue LIKE CONCAT(t.col, '%')`; a stored address containing `%` or `_` would make the `LIKE` misbehave (false pass). Negligible for real address data. |
+| F17 | design (deferred) | §C twice flags "make the reference-column type check fatal in `sp_validate_config`" as a follow-up — still accurate; today it is a WARN in `sp_discover_user_references` only. |
+
+Doc-accuracy fixes already applied to `01-Design-and-Architecture.md`: component list ("five" → the table; added `FkConstraintBackup`), `Synthetic*` table names, and §C "Case sensitivity / collation" rewritten to match F11.

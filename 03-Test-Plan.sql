@@ -328,8 +328,33 @@ FROM dap_User;
 -- EXPECT: a second run with the same salt leaves AltEmail unchanged.
 
 -- ---------------------------------------------------------------------
+-- TEST 15: Collation-agnostic reference joins
+--   OriginalUserID is stored LOWER()-cased and every reference join is
+--   m.OriginalUserID = LOWER(t.<col>), so case-variant reference values
+--   resolve correctly regardless of column collation.
+-- ---------------------------------------------------------------------
+-- 15a. A mixed-case value in a reference column links to the right user.
+-- UPDATE dap_Actor SET CreatedBy = 'JOHN@TEST.COM' WHERE ActorID = 1;   -- same user, upper case
+-- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- SELECT COUNT(*) FROM UserObfuscationMapping WHERE OriginalUserID <> LOWER(OriginalUserID);  -- EXPECT: 0
+-- SELECT COUNT(*) FROM UserObfuscationMapping;                                                -- EXPECT: 3 (no spurious 4th)
+-- SELECT a.CreatedBy = m.ObfuscatedUserID
+--   FROM dap_Actor a JOIN UserObfuscationMapping m ON m.OriginalUserID='john@test.com' WHERE a.ActorID=1;  -- EXPECT: 1
+
+-- 15b. Under a case-sensitive collation, case-only duplicate UserIDs are rejected.
+-- ALTER TABLE dap_Actor DROP FOREIGN KEY FK_Actor_User;
+-- ALTER TABLE dap_User MODIFY UserID VARCHAR(255) COLLATE utf8mb4_bin;
+-- INSERT INTO dap_User (UserID,FirstName,LastName) VALUES ('John@dup.com','J','D'),('john@dup.com','j','d');
+-- CALL sp_create_user_mapping(UUID(),'test-salt-001');
+-- EXPECT: SQLSTATE 45000 ('dap_User.UserID has case-only duplicate values.').
+
+-- ---------------------------------------------------------------------
 -- Review the full run history at any point:
 -- ---------------------------------------------------------------------
 SELECT * FROM ObfuscationRunLog ORDER BY LogID;
 SELECT * FROM ObfuscationRun    ORDER BY StartedAt;
 -- CALL sp_obfuscation_status();
+
+-- ---------------------------------------------------------------------
+-- Or drive the whole plan as assertions:  bash test/run-all.sh
+-- ---------------------------------------------------------------------

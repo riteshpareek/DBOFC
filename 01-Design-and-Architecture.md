@@ -8,14 +8,15 @@ Target: MariaDB, lower-environment copy of the Appian production schema (`Appian
 
 Everything runs **inside the lower-environment database**, after the production→lower copy has finished and **before** the environment is opened to general users. Nothing runs against production.
 
-The framework has five moving parts:
+The framework's moving parts:
 
 | Component | Purpose |
 |---|---|
 | `ObfuscationConfig` | Declares which `(TableName, ColumnName)` pairs get obfuscated and how (`ObfuscationType`). Drives everything — no hard-coded column lists in the procedures. |
 | `UserReferenceRegistry` | Auto-discovered (+ manually confirmed) list of every column that stores a `dap_User.UserID` value — FK-based and convention-based (`CreatedBy`, `ModifiedBy`, etc.). Each row also carries an `OrphanAction` (`OBFUSCATE` default / `NULLIFY` / `IGNORE`) deciding what happens to a value in that column that matches no real `dap_User`. |
 | `UserObfuscationMapping` | The one-to-one original→obfuscated email mapping. Deterministic, salted SHA-256 based. This table holds real PII and is the only place that does — see §C for lifecycle handling. |
-| `Synthetic*` reference tables | Small seed tables (`SyntheticFirstName`, `SyntheticLastName`, `SyntheticStreet`, `SyntheticSuburb`) used to build "meaningful-looking" replacement names/addresses, selected deterministically per-user (not per-value). |
+| `Synthetic*` reference tables | Small seed tables (`SyntheticFirstName`, `SyntheticLastName`, `SyntheticStreetAddress`) used to build "meaningful-looking" replacement names/addresses, selected deterministically per-user (not per-value). Extend freely; `SeedID` only has to be unique. |
+| `FkConstraintBackup` | Exact definitions of FK constraints while they are dropped mid-run. Transient — the orchestrator discards already-restored rows at the start of every run; a non-empty table means a run stopped between FK drop and restore. |
 | `ObfuscationRowCountSnapshot` | Per-run `BEFORE`/`AFTER` `COUNT(*)` for `dap_User` and every table named in the config/registry. Drives the row-count reconciliation in `sp_validate_obfuscation`. |
 | `ObfuscationRun` | One header row per `sp_obfuscate_database()` call: `RUNNING` → `COMPLETED` / `FAILED` / `SUPERSEDED`, the salt used, timestamps, and the captured error on failure. Lets `sp_obfuscation_status()` report whether a schema is mid-migration. |
 | Stored procedure suite | Orchestration (`sp_obfuscate_database`) + focused sub-procedures, each independently callable/testable. |
@@ -176,7 +177,7 @@ This is safer than disabling checks because a broken mapping surfaces as a hard 
 
 **Duplicate names across users.** Per the spec, "John Smith / John Brown / John Taylor" must not collapse into the same synthetic identity just because they share a first name. Synthetic name selection is therefore keyed off **the user's obfuscated identity**, not off the literal `FirstName`/`LastName` value — `CRC32(SHA2(CONCAT(salt, UserID_or_row_key), 256))` picks the synthetic name index. Same user always gets the same synthetic name across a re-run (determinism); different users with the same real first name get independently chosen synthetic names.
 
-**Case sensitivity / collation.** Email comparisons/joins are done against `LOWER()`-normalized values internally where the mapping is built, but the *stored* obfuscated value preserves standard lower-case email convention. The framework does not assume a case-insensitive collation on production copy — it normalizes explicitly rather than relying on the schema's default collation.
+**Case sensitivity / collation.** The framework does not rely on the schema's default collation to match email values across case. `UserObfuscationMapping.OriginalUserID` is stored `LOWER()`-cased (and `fn_generate_obfuscated_email()` lowercases its hash input), so `John@x.com` and `john@x.com` always resolve to the same obfuscated value. Every join from a user-reference column back to the mapping is written `m.OriginalUserID = LOWER(t.<col>)` — the function sits only on the (already-scanned) reference-column side, so the mapping-table primary key stays usable for the lookup. `sp_create_user_mapping()` first refuses (`SIGNAL 45000`) if `dap_User` holds rows that differ only by `UserID` letter case — impossible under a case-insensitive PK, but a `*_bin` / `*_cs` collation would allow it, and silently merging two real users is worse than a hard stop.
 
 **Large tables / long-running transactions.** Config-driven column updates are batched (configurable batch size, default 50,000 rows) via a `LIMIT`-based loop keyed on primary key, rather than one massive single-statement `UPDATE`, to avoid long lock waits and huge rollback segments on multi-million-row Appian process/audit tables.
 

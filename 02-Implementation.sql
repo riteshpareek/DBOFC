@@ -92,14 +92,19 @@ CREATE TABLE IF NOT EXISTS ObfuscationRunLog (
 -- fully recoverable by re-running. This table + sp_obfuscation_status() make
 -- that state visible instead of silent.
 CREATE TABLE IF NOT EXISTS ObfuscationRun (
-    RunID       CHAR(36)     NOT NULL PRIMARY KEY,
-    Status      VARCHAR(20)  NOT NULL,   -- RUNNING | COMPLETED | FAILED | SUPERSEDED
-    Salt        VARCHAR(64)  NULL,       -- kept so a resume run can reuse the same salt
-    StartedAt   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    FinishedAt  DATETIME     NULL,
-    ErrorSqlState CHAR(5)    NULL,
-    ErrorText   VARCHAR(512) NULL
+    RunID       CHAR(36)      NOT NULL PRIMARY KEY,
+    Status      VARCHAR(20)   NOT NULL,   -- RUNNING | COMPLETED | FAILED | SUPERSEDED
+    Salt        VARCHAR(64)   NULL,       -- kept so a resume run can reuse the same salt
+    -- microsecond precision so back-to-back runs order deterministically
+    StartedAt   DATETIME(6)   NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    FinishedAt  DATETIME(6)   NULL,
+    ErrorSqlState CHAR(5)     NULL,
+    ErrorText   VARCHAR(512)  NULL
 ) ENGINE=InnoDB;
+-- Upgrade precision on installs created before DATETIME(6).
+ALTER TABLE ObfuscationRun
+    MODIFY COLUMN StartedAt  DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    MODIFY COLUMN FinishedAt DATETIME(6) NULL;
 
 -- Per-run BEFORE/AFTER row counts for the reconciliation check in
 -- sp_validate_obfuscation (no obfuscation step should add or remove rows).
@@ -506,6 +511,24 @@ BEGIN
     -- reserve room for '@example.invalid' (16 chars)
     SET v_local_len = GREATEST(v_col_len - 17, 8);
 
+    -- OriginalUserID is stored LOWER()-cased so downstream reference joins can be
+    -- collation-agnostic (m.OriginalUserID = LOWER(t.<col>)) without depending on
+    -- the schema's default collation. That only works as a 1:1 mapping if no two
+    -- dap_User rows differ solely by UserID letter case -- a case-insensitive PK
+    -- forbids it, but a *_bin / *_cs collation would not, and merging two real
+    -- users is worse than a hard stop.
+    IF EXISTS (
+        SELECT 1 FROM (
+            SELECT LOWER(UserID) lu FROM dap_User WHERE UserID IS NOT NULL
+            GROUP BY lu HAVING COUNT(*) > 1
+        ) d
+    ) THEN
+        CALL sp_log_step(p_run_id, 'sp_create_user_mapping', 'ERROR',
+            'dap_User has rows that differ only by UserID letter case; a 1:1 obfuscation mapping is impossible. Resolve the duplicates first.');
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'dap_User.UserID has case-only duplicate values.';
+    END IF;
+
     -- Insert mapping for any user not yet mapped.
     --
     -- IDEMPOTENCY NOTE: on a re-run, dap_User.UserID may already HOLD an
@@ -528,11 +551,11 @@ BEGIN
     -- INSERT would instead abort the whole procedure on the first such
     -- collision, making the retry loop unreachable.
     INSERT IGNORE INTO UserObfuscationMapping (OriginalUserID, ObfuscatedUserID, CreatedDate)
-    SELECT u.UserID,
+    SELECT LOWER(u.UserID),
            fn_generate_obfuscated_email(u.UserID, p_salt, 0, v_local_len),
            NOW()
     FROM dap_User u
-    LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = u.UserID
+    LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(u.UserID)
     WHERE m.OriginalUserID IS NULL
       AND u.UserID IS NOT NULL
       AND u.UserID NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping);
@@ -542,7 +565,7 @@ BEGIN
     -- Retry loop, escalating the attempt counter, capped to avoid infinite loop.
     SET v_remaining = (
         SELECT COUNT(*) FROM dap_User u
-        LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = u.UserID
+        LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(u.UserID)
         WHERE m.OriginalUserID IS NULL AND u.UserID IS NOT NULL
           AND u.UserID NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping)
     );
@@ -551,17 +574,17 @@ BEGIN
         DECLARE v_attempt INT DEFAULT 1;
         WHILE v_remaining > 0 AND v_attempt <= 5 DO
             INSERT IGNORE INTO UserObfuscationMapping (OriginalUserID, ObfuscatedUserID, CreatedDate)
-            SELECT u.UserID,
+            SELECT LOWER(u.UserID),
                    fn_generate_obfuscated_email(u.UserID, p_salt, v_attempt, v_local_len),
                    NOW()
             FROM dap_User u
-            LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = u.UserID
+            LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(u.UserID)
             WHERE m.OriginalUserID IS NULL AND u.UserID IS NOT NULL
               AND u.UserID NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping);
 
             SET v_remaining = (
                 SELECT COUNT(*) FROM dap_User u
-                LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = u.UserID
+                LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(u.UserID)
                 WHERE m.OriginalUserID IS NULL AND u.UserID IS NOT NULL
                   AND u.UserID NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping)
             );
@@ -638,7 +661,7 @@ BEGIN
             'SELECT ', QUOTE(v_table), ', ', QUOTE(v_column), ', ', QUOTE(v_action), ', ',
                    't.', fn_quote_identifier(v_column), ', COUNT(*) ',
             'FROM ', fn_quote_identifier(v_table), ' t ',
-            'LEFT JOIN UserObfuscationMapping mo ON mo.OriginalUserID   = t.', fn_quote_identifier(v_column), ' ',
+            'LEFT JOIN UserObfuscationMapping mo ON mo.OriginalUserID   = LOWER(t.', fn_quote_identifier(v_column), ') ',
             'LEFT JOIN UserObfuscationMapping mx ON mx.ObfuscatedUserID = t.', fn_quote_identifier(v_column), ' ',
             'WHERE t.', fn_quote_identifier(v_column), ' IS NOT NULL ',
             '  AND mo.OriginalUserID IS NULL ',
@@ -715,7 +738,7 @@ BEGIN
                     'UPDATE ', fn_quote_identifier(v_table), ' t ',
                     'SET t.', fn_quote_identifier(v_column), ' = NULL ',
                     'WHERE t.', fn_quote_identifier(v_column), ' IS NOT NULL ',
-                    '  AND t.', fn_quote_identifier(v_column), ' NOT IN (SELECT OriginalUserID   FROM UserObfuscationMapping) ',
+                    '  AND LOWER(t.', fn_quote_identifier(v_column), ') NOT IN (SELECT OriginalUserID   FROM UserObfuscationMapping) ',
                     '  AND t.', fn_quote_identifier(v_column), ' NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping) ',
                     'LIMIT 50000');
                 SET @sql_stmt = v_sql;
@@ -735,11 +758,11 @@ BEGIN
         WHILE v_remaining > 0 AND v_attempt <= 5 DO
             SET v_sql = CONCAT(
                 'INSERT IGNORE INTO UserObfuscationMapping (OriginalUserID, ObfuscatedUserID, CreatedDate) ',
-                'SELECT DISTINCT t.', fn_quote_identifier(v_column), ', ',
+                'SELECT DISTINCT LOWER(t.', fn_quote_identifier(v_column), '), ',
                        'fn_generate_obfuscated_email(t.', fn_quote_identifier(v_column), ', ',
                             QUOTE(p_salt), ', ', v_attempt, ', ', v_local_len, '), NOW() ',
                 'FROM ', fn_quote_identifier(v_table), ' t ',
-                'LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = t.', fn_quote_identifier(v_column), ' ',
+                'LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(t.', fn_quote_identifier(v_column), ') ',
                 'WHERE t.', fn_quote_identifier(v_column), ' IS NOT NULL ',
                 '  AND m.OriginalUserID IS NULL ',
                 '  AND t.', fn_quote_identifier(v_column), ' NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping)');
@@ -750,7 +773,7 @@ BEGIN
                 'SELECT COUNT(*) INTO @orphan_remaining FROM (',
                   'SELECT DISTINCT t.', fn_quote_identifier(v_column), ' AS v ',
                   'FROM ', fn_quote_identifier(v_table), ' t ',
-                  'LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = t.', fn_quote_identifier(v_column), ' ',
+                  'LEFT JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(t.', fn_quote_identifier(v_column), ') ',
                   'WHERE t.', fn_quote_identifier(v_column), ' IS NOT NULL ',
                   '  AND m.OriginalUserID IS NULL ',
                   '  AND t.', fn_quote_identifier(v_column), ' NOT IN (SELECT ObfuscatedUserID FROM UserObfuscationMapping)',
@@ -937,7 +960,7 @@ BEGIN
             -- rejects it -- do not port this batching pattern to MySQL as-is.
             SET v_sql = CONCAT(
                 'UPDATE ', fn_quote_identifier(v_table), ' t ',
-                'JOIN UserObfuscationMapping m ON m.OriginalUserID = t.', fn_quote_identifier(v_column), ' ',
+                'JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(t.', fn_quote_identifier(v_column), ') ',
                 'SET t.', fn_quote_identifier(v_column), ' = m.ObfuscatedUserID ',
                 'WHERE t.', fn_quote_identifier(v_column), ' <> m.ObfuscatedUserID ',
                 'LIMIT ', p_batch_size
@@ -966,7 +989,7 @@ DELIMITER $$
 CREATE OR REPLACE PROCEDURE sp_obfuscate_user_table(IN p_run_id CHAR(36))
 BEGIN
     UPDATE dap_User u
-    JOIN UserObfuscationMapping m ON m.OriginalUserID = u.UserID
+    JOIN UserObfuscationMapping m ON m.OriginalUserID = LOWER(u.UserID)
     SET u.UserID = m.ObfuscatedUserID
     WHERE u.UserID <> m.ObfuscatedUserID;
 
