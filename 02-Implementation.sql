@@ -49,6 +49,23 @@ CREATE TABLE IF NOT EXISTS obf_UserReferenceRegistry (
 ALTER TABLE obf_UserReferenceRegistry
     ADD COLUMN IF NOT EXISTS OrphanAction VARCHAR(10) NOT NULL DEFAULT 'OBFUSCATE';
 
+-- obf_sp_obfuscate_configured_columns needs a deterministic per-row seed column
+-- (a registered user-reference column, else the table's own PRIMARY KEY) to
+-- generate stable synthetic values. Some real schemas have tables with an
+-- obvious unique row identifier (an "id"/"XxxID" column) that was simply never
+-- declared as a PRIMARY KEY constraint. Rather than requiring a DBA to alter
+-- the target application's schema just to unblock obfuscation, this table
+-- lets them register that column explicitly as a manual seed -- checked only
+-- after the user-reference and true-PRIMARY-KEY lookups both come up empty.
+-- The DBA is responsible for confirming the column is actually unique per row
+-- (a non-unique seed does not corrupt data -- worst case two rows collapse
+-- onto the same synthetic value -- but does weaken the "distinct rows get
+-- distinct synthetic identities" property).
+CREATE TABLE IF NOT EXISTS obf_TableSeedOverride (
+    TableName   VARCHAR(128) NOT NULL PRIMARY KEY,
+    ColumnName  VARCHAR(128) NOT NULL
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS obf_UserObfuscationMapping (
     OriginalUserID    VARCHAR(255) NOT NULL,
     ObfuscatedUserID  VARCHAR(255) NOT NULL,
@@ -191,7 +208,15 @@ BEGIN
         SET p_local_part_len = 8; -- floor to keep collision risk sane
     END IF;
 
-    SET v_local = LOWER(SUBSTRING(v_hash, 1, LEAST(p_local_part_len, 40)));
+    -- Ceiling of 33 caps the local part so the full email (33 + 16-char
+    -- '@example.invalid' domain = 49 chars max) never crosses 50 characters,
+    -- NO MATTER HOW WIDE dap_User.UserID is -- so it fits any reference
+    -- column at least 50 characters wide without a schema change. 33 hex
+    -- chars is still ~132 bits of hash entropy -- collision risk is
+    -- unaffected. obf_sp_validate_reference_column_lengths mirrors this same
+    -- 33-char (+17 for a 1-char safety margin) ceiling; keep the two in sync
+    -- if this ever changes.
+    SET v_local = LOWER(SUBSTRING(v_hash, 1, LEAST(p_local_part_len, 33)));
 
     RETURN CONCAT(v_local, '@example.invalid');
 END$$
@@ -517,9 +542,11 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'dap_User.UserID column not found.';
     END IF;
 
-    -- Same formula as obf_sp_create_user_mapping / obf_fn_generate_obfuscated_email.
+    -- Same formula as obf_sp_create_user_mapping / obf_fn_generate_obfuscated_email,
+    -- including that function's 33-char local-part ceiling (-> 50 chars total,
+    -- regardless of how wide dap_User.UserID itself is). Keep in sync with it.
     SET v_local_len = GREATEST(v_userid_len - 17, 8);
-    SET v_required_len = LEAST(v_local_len, 40) + 17;
+    SET v_required_len = LEAST(v_local_len, 33) + 17;
 
     DROP TEMPORARY TABLE IF EXISTS obf_RefColumnLengthReport;
     CREATE TEMPORARY TABLE obf_RefColumnLengthReport (
@@ -1082,8 +1109,11 @@ DELIMITER ;
 --    Assumption: every table carrying PII columns also carries a
 --    UserID-typed column (itself, or via obf_UserReferenceRegistry) that
 --    identifies the owning user, used as the deterministic seed. If a
---    table has no such column, its own primary key is used as the seed
---    instead (still deterministic, just not shared across tables).
+--    table has no such column, its own PRIMARY KEY is used as the seed
+--    instead (still deterministic, just not shared across tables); if it
+--    has no PRIMARY KEY either, a column registered in
+--    obf_TableSeedOverride is used as a last resort. A table matching none
+--    of the three is SKIPped (its configured columns are left untouched).
 -- ---------------------------------------------------------------------
 
 DELIMITER $$
@@ -1154,9 +1184,17 @@ BEGIN
             );
         END IF;
 
+        -- Last resort: a DBA-registered manual seed column (see
+        -- obf_TableSeedOverride) for a table with no formal PRIMARY KEY.
+        IF v_pk_col IS NULL THEN
+            SET v_pk_col = (
+                SELECT ColumnName FROM obf_TableSeedOverride WHERE TableName = v_table
+            );
+        END IF;
+
         IF v_pk_col IS NULL THEN
             CALL obf_sp_log_step(p_run_id, 'obf_sp_obfuscate_configured_columns', 'SKIP',
-                CONCAT('No usable seed column (user reference or PK) found for ', v_table, '.', v_column));
+                CONCAT('No usable seed column (user reference, PK, or obf_TableSeedOverride) found for ', v_table, '.', v_column));
         ELSE
             SET v_col_len = (
                 SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.COLUMNS

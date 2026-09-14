@@ -360,6 +360,32 @@ FROM dap_User;
 --   obf_ObfuscationRunLog names dap_Actor.CreatedBy with its current/required length.
 
 -- ---------------------------------------------------------------------
+-- TEST 17: The obfuscated user id never crosses 50 characters, so a
+--   VARCHAR(50) reference column succeeds with NO schema change.
+-- ---------------------------------------------------------------------
+-- (reset fixture)
+-- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(50);
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: run succeeds (no SQLSTATE 45000).
+-- SELECT MAX(LENGTH(CreatedBy)) FROM dap_Actor;   -- EXPECT: <= 50 (currently 49)
+
+-- ---------------------------------------------------------------------
+-- TEST 18: obf_TableSeedOverride unblocks a configured column on a table
+--   with no user-reference column and no formal PRIMARY KEY (real legacy/
+--   staging tables sometimes have an "id"-style column that was never
+--   declared as a key constraint).
+-- ---------------------------------------------------------------------
+-- (reset fixture)
+-- CREATE TABLE dap_NoPkContact (id INT NOT NULL, FirstName VARCHAR(50));
+-- INSERT INTO dap_NoPkContact (id, FirstName) VALUES (1,'John'),(2,'Jane');
+-- INSERT INTO obf_ObfuscationConfig (TableName,ColumnName,ObfuscationType) VALUES ('dap_NoPkContact','FirstName','FIRST_NAME');
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: FirstName untouched; obf_ObfuscationRunLog has a SKIP row naming dap_NoPkContact.
+-- INSERT INTO obf_TableSeedOverride (TableName, ColumnName) VALUES ('dap_NoPkContact','id');
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: FirstName now obfuscated (drawn from obf_SyntheticFirstName), keyed off id.
+
+-- ---------------------------------------------------------------------
 -- Review the full run history at any point:
 -- ---------------------------------------------------------------------
 SELECT * FROM obf_ObfuscationRunLog ORDER BY LogID;

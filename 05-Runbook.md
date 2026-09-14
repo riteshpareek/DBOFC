@@ -119,6 +119,18 @@ Notes:
 Free-text / JSON columns are **not** scanned. Add them explicitly here (usually `STATIC`)
 if you know they hold PII.
 
+**Tables with no PRIMARY KEY:** a configured column can only be obfuscated deterministically
+if the framework can find a stable per-row seed — a registered user-reference column, else
+the table's own `PRIMARY KEY`. Some real schemas have a table with an obvious unique row-id
+column (`id`, `RefereeID`, …) that was never declared as an actual `PRIMARY KEY` constraint.
+Rather than requiring a schema change, register it manually:
+```sql
+INSERT INTO obf_TableSeedOverride (TableName, ColumnName) VALUES ('SomeTable', 'id');
+```
+Without either a PK or an override row, the run logs a `SKIP` for that table's configured
+columns and leaves them untouched — check `obf_ObfuscationRunLog` for `SKIP` rows naming a
+table if PII you configured doesn't appear to have changed after a run.
+
 ---
 
 ## 4. Pre-flight — read-only, no data changes
@@ -158,10 +170,13 @@ CALL obf_sp_validate_reference_column_lengths(UUID());
 ```
 
 Every column in `obf_UserReferenceRegistry` gets overwritten with the **same** obfuscated
-email that's written to `dap_User.UserID`, so it must be at least as wide as that value gets
-(driven by `dap_User.UserID`'s own column width). A narrower column → **hard error**
-(`Data too long for column '<col>'` is exactly this, if you hit it without running this
-check first). Fix by widening the column, or by disabling that reference column:
+email that's written to `dap_User.UserID`. `obf_fn_generate_obfuscated_email` caps that value
+at **49 characters, no matter how wide `dap_User.UserID` itself is** (33-char local part +
+16-char `@example.invalid` domain), so any reference column **50 characters or wider** is
+always safe with **no schema change**. Only a column narrower than 50 chars → **hard error**
+(`Data too long for column '<col>'` is exactly this, if you hit it without running this check
+first). Fix by widening the column to 50+, or by disabling that reference column (only if you
+don't actually need it obfuscated — this leaves its original value untouched):
 ```sql
 UPDATE obf_UserReferenceRegistry SET Enabled = FALSE
  WHERE TableName = '...' AND ColumnName = '...';
@@ -319,8 +334,8 @@ CALL obf_sp_obfuscation_status();
 
 **Fix the cause** the error points at (e.g. a data problem an FK won't accept, a bad
 config row, or — a sample first-run failure — `Data too long for column '<col>'`, meaning
-that `<col>` is a registered reference column too narrow to hold the obfuscated email; widen
-it or `Enabled = FALSE` it per step 4c, then resume), then **re-run
+`<col>` is a registered reference column narrower than the 50-character floor per step 4c;
+widen it to 50+ or `Enabled = FALSE` it, then resume), then **re-run
 `obf_sp_obfuscate_database` with the exact same salt**:
 
 ```sql

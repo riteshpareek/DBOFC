@@ -211,6 +211,26 @@ chk "16a narrow ref column -> orchestrator errors out" "$([ "$RC" -ne 0 ] && ech
 chk "16b: FK not yet dropped (caught before any destructive step)" "$(q "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_NAME='FK_Actor_User';")" "1"
 chk "16c: log names the offending column" "$(q "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE StepName='obf_sp_validate_reference_column_lengths' AND Message LIKE '%dap_Actor.CreatedBy%';")" "1"
 
+echo "### TEST 17  obfuscated user id never crosses 50 chars -> VARCHAR(50) needs no schema change"
+reset
+q "ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(50);" >/dev/null
+RC=$($MYSQL $DBOBF_DB -e "CALL obf_sp_obfuscate_database('test-salt-001',10000,FALSE);" >/dev/null 2>&1; echo $?)
+chk "17a VARCHAR(50) ref column -> run succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)" "1"
+chk "17b: obfuscated CreatedBy fits in 50 chars" "$(q "SELECT MAX(LENGTH(CreatedBy))<=50 FROM dap_Actor;")" "1"
+
+echo "### TEST 18  obf_TableSeedOverride unblocks a table with no PRIMARY KEY"
+reset
+q "CREATE TABLE dap_NoPkContact (id INT NOT NULL, FirstName VARCHAR(50));
+   INSERT INTO dap_NoPkContact (id, FirstName) VALUES (1,'John'),(2,'Jane');
+   INSERT INTO obf_ObfuscationConfig (TableName,ColumnName,ObfuscationType) VALUES ('dap_NoPkContact','FirstName','FIRST_NAME');
+   CALL obf_sp_obfuscate_database('test-salt-001',10000,FALSE);" >/dev/null
+chk "18a no PK, no override -> left untouched" "$(q "SELECT COUNT(*) FROM dap_NoPkContact WHERE FirstName IN ('John','Jane');")" "2"
+chk "18a: SKIP logged" "$(q "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE StepName='obf_sp_obfuscate_configured_columns' AND StepStatus='SKIP' AND Message LIKE '%dap_NoPkContact%';")" "1"
+q "INSERT INTO obf_TableSeedOverride (TableName, ColumnName) VALUES ('dap_NoPkContact','id');
+   CALL obf_sp_obfuscate_database('test-salt-001',10000,FALSE);" >/dev/null
+chk "18b override registered -> now obfuscated" "$(q "SELECT COUNT(*) FROM dap_NoPkContact WHERE FirstName IN ('John','Jane');")" "0"
+chk "18b: values drawn from the synthetic pool" "$(q "SELECT COUNT(*) FROM dap_NoPkContact d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=d.FirstName);")" "2"
+
 echo
 echo "======================================"
 echo "  PASS: $pass   FAIL: $fail"
