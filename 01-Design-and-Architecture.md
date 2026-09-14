@@ -1,30 +1,68 @@
 # Database-Side Data Obfuscation Framework — Design Document
 
-Target: MariaDB, lower-environment copy of the Appian production schema (`Appian`).
+Target: MariaDB, lower-environment copy of the Appian production schema (target schema —
+e.g. `Appian`, `appiandev2`).
 
 ---
 
 ## A. Proposed Architecture
 
-Everything runs **inside the lower-environment database**, after the production→lower copy has finished and **before** the environment is opened to general users. Nothing runs against production.
+The framework installs entirely into its own dedicated **admin schema** (`obf_admin` — a
+fixed name), separate from every application/target schema it obfuscates. Nothing in
+`obf_admin` is ever installed into a target schema; the target is instead named as an
+explicit `p_target_schema` parameter to every entry point. One `obf_admin` install can
+therefore obfuscate any number of target schemas over time, each fully isolated from the
+others — see "Multi-target isolation" in §C.
 
-The framework's moving parts:
+Everything runs **inside the lower environment**, after the production→lower copy has
+finished for the target schema and **before** the environment is opened to general users.
+Nothing runs against production.
+
+The framework's moving parts (all in `obf_admin`, each state table scoped by a
+`TargetSchema` column unless noted otherwise):
 
 | Component | Purpose |
 |---|---|
-| `obf_ObfuscationConfig` | Declares which `(TableName, ColumnName)` pairs get obfuscated and how (`ObfuscationType`). Drives everything — no hard-coded column lists in the procedures. |
-| `obf_UserReferenceRegistry` | Auto-discovered (+ manually confirmed) list of every column that stores a `dap_User.UserID` value — FK-based and convention-based (`CreatedBy`, `ModifiedBy`, etc.). Each row also carries an `OrphanAction` (`OBFUSCATE` default / `NULLIFY` / `IGNORE`) deciding what happens to a value in that column that matches no real `dap_User`. |
-| `obf_UserObfuscationMapping` | The one-to-one original→obfuscated email mapping. Deterministic, salted SHA-256 based. This table holds real PII and is the only place that does — see §C for lifecycle handling. |
-| `Synthetic*` reference tables | Small seed tables (`obf_SyntheticFirstName`, `obf_SyntheticLastName`, `obf_SyntheticStreetAddress`) used to build "meaningful-looking" replacement names/addresses, selected deterministically per-user (not per-value). Extend freely; `SeedID` only has to be unique. |
-| `obf_FkConstraintBackup` | Exact definitions of FK constraints while they are dropped mid-run. Transient — the orchestrator discards already-restored rows at the start of every run; a non-empty table means a run stopped between FK drop and restore. |
-| `obf_ObfuscationRowCountSnapshot` | Per-run `BEFORE`/`AFTER` `COUNT(*)` for `dap_User` and every table named in the config/registry. Drives the row-count reconciliation in `obf_sp_validate_obfuscation`. |
-| `obf_ObfuscationRun` | One header row per `obf_sp_obfuscate_database()` call: `RUNNING` → `COMPLETED` / `FAILED` / `SUPERSEDED`, the salt used, timestamps, and the captured error on failure. Lets `obf_sp_obfuscation_status()` report whether a schema is mid-migration. |
-| Stored procedure suite | Orchestration (`obf_sp_obfuscate_database`) + focused sub-procedures, each independently callable/testable. |
+| `obf_ObfuscationConfig` | Declares which `(TargetSchema, TableName, ColumnName)` triples get obfuscated and how (`ObfuscationType`). Drives everything — no hard-coded column lists in the procedures. |
+| `obf_UserReferenceRegistry` | Auto-discovered (+ manually confirmed) list of every column, per target schema, that stores a `dap_User.UserID` value — FK-based and convention-based (`CreatedBy`, `ModifiedBy`, etc.). Each row also carries an `OrphanAction` (`OBFUSCATE` default / `NULLIFY` / `IGNORE`) deciding what happens to a value in that column that matches no real `dap_User`. |
+| `obf_UserObfuscationMapping` | The one-to-one original→obfuscated email mapping, per target schema (`PRIMARY KEY (TargetSchema, OriginalUserID)`). Deterministic, salted SHA-256 based. This table holds real PII and is the only place that does — see §C for lifecycle handling. |
+| `obf_TableSeedOverride` | Per-target, DBA-registered `(TargetSchema, TableName) → ColumnName` mapping used as a last-resort deterministic seed for a table that has neither a registered user-reference column nor a formal `PRIMARY KEY` (real legacy/staging tables sometimes have an unmistakable `id`/`XxxID` column that was simply never declared as a key constraint) — avoids requiring a target-schema DDL change just to unblock obfuscation. |
+| `Synthetic*` reference tables | Small seed tables (`obf_SyntheticFirstName`, `obf_SyntheticLastName`, `obf_SyntheticStreetAddress`) used to build "meaningful-looking" replacement names/addresses, selected deterministically per-user (not per-value). **Global** — shared across every target schema, not scoped by `TargetSchema`, since the seed pool has no reason to be duplicated per target. Extend freely; `SeedID` only has to be unique. |
+| `obf_FkConstraintBackup` | Exact definitions of FK constraints while they are dropped mid-run, per target. Transient — the orchestrator discards already-restored rows for a target at the start of every run against it; a non-empty set of un-restored rows for a target means a run against it stopped between FK drop and restore. |
+| `obf_ObfuscationRowCountSnapshot` | Per-run, per-target `BEFORE`/`AFTER` `COUNT(*)` for `dap_User` and every table named in that target's config/registry. Drives the row-count reconciliation in `obf_sp_validate_obfuscation`. |
+| `obf_ObfuscationRun` | One header row per `obf_sp_obfuscate_database()` call: `RUNNING` → `COMPLETED` / `FAILED` / `SUPERSEDED`, the target schema, the salt used, timestamps, and the captured error on failure. Lets `obf_sp_obfuscation_status(target)` report whether that target is mid-migration — scoped so one target's run history never shadows another's. |
+| Stored procedure suite | Orchestration (`obf_sp_obfuscate_database`) + focused sub-procedures, each independently callable/testable, every one taking `p_target_schema` as its first parameter. |
+
+### Why an admin schema, and how cross-schema references work
+
+MariaDB resolves an **unqualified** table/routine reference inside a stored routine's body
+against the **caller's current default schema at CALL time** — not the schema the routine
+was defined in. Splitting the framework out therefore needs two different qualification
+strategies:
+
+- **References to the framework's own `obf_admin` objects** — the admin schema's name is a
+  fixed constant chosen once, so every reference (including each object's own `CREATE`
+  statement) is simply hard-qualified with `` `obf_admin`. ``, uniformly, everywhere. No
+  dynamic SQL is needed for this half.
+- **References to target-schema tables** (`dap_User`, and every dynamically-named table
+  from `obf_ObfuscationConfig` / `obf_UserReferenceRegistry`) — the schema name is only
+  known at runtime (`p_target_schema`), and MariaDB only allows a variable to appear as
+  part of a table identifier inside dynamic SQL (`PREPARE`/`EXECUTE`). A small helper,
+  `obf_fn_quote_qualified(p_schema, p_table)`, builds the backtick-quoted `` `schema`.`table` ``
+  text used everywhere a target-table reference is constructed dynamically (most of the
+  framework already builds target-table SQL dynamically, since table/column names are
+  already runtime data from the config tables — this only added the schema-name half of
+  that qualification). A handful of statements that referenced `dap_User` *statically*
+  (not build via `PREPARE`/`EXECUTE`) had to be converted to dynamic SQL for the same
+  reason.
 
 ### Stored procedure suite
 
+Every procedure lives in `obf_admin` and takes the target schema name as its **first**
+parameter (omitted below for readability — read each as `obf_admin.obf_sp_x(p_target_schema, ...)`):
+
 ```
-obf_sp_obfuscate_database()                  -- master orchestrator, single entry point
+obf_sp_obfuscate_database(salt, batch, purge)    -- master orchestrator, single entry point
  │
  ├─ obf_sp_validate_config()                 -- checks every configured column exists (fatal if
  │                                           not); flags configured columns under a UNIQUE
@@ -36,24 +74,29 @@ obf_sp_obfuscate_database()                  -- master orchestrator, single entr
  │                                           flags registered columns whose datatype is
  │                                           incompatible with dap_User.UserID
  │
+ ├─ obf_sp_validate_reference_column_lengths()  -- every registered reference column must be
+ │                                           wide enough to hold the obfuscated user id (see
+ │                                           "Obfuscated-id length ceiling" in §C); hard-stops
+ │                                           BEFORE any destructive step if not
+ │
  ├─ obf_sp_snapshot_row_counts('BEFORE')     -- records COUNT(*) per dap_User / config /
  │                                           registry table for the reconciliation check
  │
- ├─ obf_sp_create_user_mapping()             -- builds obf_UserObfuscationMapping from
+ ├─ obf_sp_create_user_mapping(salt)         -- builds obf_UserObfuscationMapping from
  │                                           dap_User.UserID, deterministic + collision-safe
  │
  ├─ obf_sp_report_orphan_user_references()   -- pre-flight (read-only): lists reference-column
  │                                           values that match no dap_User.UserID, for the
  │                                           DBA to eyeball before anything destructive
  │
- ├─ obf_sp_resolve_orphan_user_references()  -- handles those strays per column's
+ ├─ obf_sp_resolve_orphan_user_references(salt)  -- handles those strays per column's
  │                                           obf_UserReferenceRegistry.OrphanAction
  │                                           (OBFUSCATE | NULLIFY | IGNORE)
  │
  ├─ obf_sp_drop_user_fk_constraints()        -- captures & drops FKs that reference
  │                                           dap_User.UserID (see §C, "FK strategy")
  │
- ├─ obf_sp_obfuscate_user_references()       -- dynamic UPDATE...JOIN for every table/column
+ ├─ obf_sp_obfuscate_user_references(batch)  -- dynamic UPDATE...JOIN for every table/column
  │                                           in obf_UserReferenceRegistry
  │
  ├─ obf_sp_obfuscate_user_table()            -- updates dap_User.UserID itself from the mapping
@@ -61,9 +104,10 @@ obf_sp_obfuscate_database()                  -- master orchestrator, single entr
  ├─ obf_sp_restore_user_fk_constraints()     -- re-creates the FKs captured above; MariaDB
  │                                           validates data integrity as a side-effect
  │
- ├─ obf_sp_obfuscate_configured_columns()    -- dynamic SQL loop over obf_ObfuscationConfig,
+ ├─ obf_sp_obfuscate_configured_columns(batch, salt)  -- dynamic SQL loop over obf_ObfuscationConfig,
  │                                           dispatches to per-type logic (NAME/PHONE/
- │                                           EMAIL/ADDRESS/STATIC/HASH)
+ │                                           EMAIL/ADDRESS/STATIC/HASH); seed resolution falls
+ │                                           back to obf_TableSeedOverride as a last resort
  │
  ├─ obf_sp_validate_obfuscation()            -- orphaned user-reference check; row-count
  │                                           reconciliation vs the BEFORE snapshot;
@@ -73,27 +117,33 @@ obf_sp_obfuscate_database()                  -- master orchestrator, single entr
  └─ obf_sp_purge_sensitive_staging()         -- optional: strips OriginalUserID out of
                                              obf_UserObfuscationMapping once cleared for release
 
-obf_sp_obfuscation_status()                  -- read-only, run separately: last run outcome,
-                                            FK constraints currently dropped, whether a
-                                            schema is mid-migration
+obf_sp_obfuscation_status()                  -- read-only, run separately: last run outcome
+                                            FOR THIS TARGET, FK constraints currently dropped,
+                                            whether it is mid-migration
 obf_sp_obfuscation_prune(keep_runs)          -- optional housekeeping, run separately: keep the
-                                            newest N runs of history, drop the rest
+                                            newest N runs of history FOR THIS TARGET, drop the rest
 ```
 
-Each sub-procedure is idempotent-aware (checks `Enabled`/existing state before redoing work) so the master procedure can be safely re-run if it fails partway through (see §C, "Idempotency").
+Each sub-procedure is idempotent-aware (checks `Enabled`/existing state before redoing work) so the master procedure can be safely re-run if it fails partway through (see §C, "Idempotency"). "Last run" / resume / supersede-stale-`RUNNING` logic throughout is scoped by `TargetSchema` — one target's genuinely-running job is never touched by a call against a different target.
 
 ### Why dynamic SQL, and how it's kept safe
 
-Table/column names live only in `obf_ObfuscationConfig` and `obf_UserReferenceRegistry`, which are themselves populated only from `information_schema` metadata or explicit inserts by a DBA/deployment script — never from end-user input. All dynamic SQL:
+Table/column names live only in `obf_ObfuscationConfig` and `obf_UserReferenceRegistry`, which are themselves populated only from `information_schema` metadata or explicit inserts by a DBA/deployment script — never from end-user input (and the target schema name itself comes only from the `p_target_schema` parameter the DBA supplies at call time). All dynamic SQL:
 
 - Uses `PREPARE` / `EXECUTE` / `DEALLOCATE PREPARE`.
-- Quotes every identifier with backticks via a small `obf_fn_quote_identifier()` helper.
+- Quotes every identifier with backticks via `obf_fn_quote_identifier()`, and every
+  schema-qualified target-table reference via `obf_fn_quote_qualified(schema, table)`
+  (which itself just delegates to `obf_fn_quote_identifier` for each half).
 - Validates that every `(TableName, ColumnName)` actually exists in `information_schema.COLUMNS` before building a statement (belt-and-braces on top of the FK/config sourcing).
 - Never concatenates *values* into SQL — obfuscated values are always passed as bound data via the mapping join, not string-built into the query text.
 
 ---
 
 ## B. Data Flow
+
+Every state table written below lives in `obf_admin`, scoped to the `TargetSchema` named
+in the call; every table read/written "in place" (`dap_User`, configured PII columns,
+reference columns) lives in the target schema itself.
 
 ```
 Production Copy (already done, out of scope)
@@ -106,6 +156,11 @@ Validate obf_ObfuscationConfig against live schema
 Discover User References  ──►  obf_UserReferenceRegistry
    (FK metadata + naming convention: CreatedBy, ModifiedBy, CreatedUserID, ...;
     datatype-compatibility flagged)
+        │
+        ▼
+Validate reference-column lengths
+   (every registered reference column must be wide enough for the obfuscated user id —
+    hard-stops here, before any destructive step, if not)
         │
         ▼
 Snapshot row counts (BEFORE)  ──►  obf_ObfuscationRowCountSnapshot
@@ -157,6 +212,45 @@ Lower Environment Ready
 
 ## C. Risks and Edge Cases
 
+**Multi-target isolation.** One `obf_admin` install can obfuscate many target schemas, so
+every admin-side state table that isn't a genuinely shared seed pool carries a
+`TargetSchema` column and is keyed/queried by it: `obf_ObfuscationConfig` and
+`obf_UserReferenceRegistry` are unique per `(TargetSchema, TableName, ColumnName)`;
+`obf_UserObfuscationMapping`'s primary key is `(TargetSchema, OriginalUserID)` (so the same
+real email maps independently, and typically to a *different* obfuscated value, per target
+— each target normally uses its own salt); `obf_TableSeedOverride` is keyed by
+`(TargetSchema, TableName)`. Crucially, every "what's the last/currently-running run"
+query in `obf_sp_obfuscate_database` (superseding a stale `RUNNING` row, detecting a resume,
+picking up the previous salt) and in `obf_sp_obfuscation_status()` filters by
+`TargetSchema` — without that, a run against one target could supersede or misreport
+another target's genuinely in-progress job. `obf_Synthetic*` name/address pools are the
+one deliberate exception: they're global, shared by every target, since there's no reason
+to duplicate the seed data per target and one shared pool is easier to extend.
+
+**Obfuscated-id length ceiling.** `obf_sp_obfuscate_user_references` writes the *same*
+obfuscated value into every registered reference column that it writes into
+`dap_User.UserID` (no per-column truncation — truncating differently per column would let
+two different users' emails collide on a narrow column). `obf_fn_generate_obfuscated_email`
+therefore caps its output at **49 characters total** (a 33-character hash local-part + the
+16-character `@example.invalid` domain), **regardless of how wide `dap_User.UserID` itself
+is** — so any reference column 50 characters or wider is always safe, with no schema
+change required. `obf_sp_validate_reference_column_lengths` (run right after discovery,
+before any destructive step) computes the same ceiling and hard-stops if any registered
+reference column is narrower than it, naming the offending `table.column` and its current
+vs. required width — this is deliberately a pre-flight check rather than letting the
+narrow column surface as a raw `Data too long for column` error mid-run, after FKs have
+already been dropped.
+
+**Tables with no formal PRIMARY KEY.** `obf_sp_obfuscate_configured_columns` needs a
+stable per-row seed to generate deterministic synthetic values: it prefers a registered
+user-reference column on the same table, else the table's own `PRIMARY KEY`. Some real
+schemas have a table with an obvious unique row-id column (`id`, `RefereeID`, …) that was
+simply never declared as an actual `PRIMARY KEY` constraint. Rather than require a
+target-schema DDL change just to unblock obfuscation, a DBA can register that column
+explicitly in `obf_TableSeedOverride` — checked only as the last resort, after both other
+lookups come up empty. A table matching none of the three is `SKIP`ped (its configured
+columns are logged as untouched, not silently left as-is without a trace).
+
 **Foreign-key update ordering.** MariaDB/InnoDB enforces FK checks per-statement with no deferred-constraint mode, so a primary key that's referenced by other tables generally *cannot* be updated in place while children still point at the old value — unless the FK has `ON UPDATE CASCADE`. Rather than `SET FOREIGN_KEY_CHECKS=0` (which silently permits orphans and gives no feedback), the framework:
 1. Reads exact FK definitions from `information_schema.KEY_COLUMN_USAGE` / `information_schema.REFERENTIAL_CONSTRAINTS` for every constraint referencing `dap_User.UserID`.
 2. Drops them.
@@ -203,8 +297,8 @@ Known gap: if a naming-convention column's real datatype isn't the `dap_User.Use
 
 **Existing obfuscated data.** Same idempotency guards above mean re-running the framework on an already-obfuscated lower environment (e.g. a repeat refresh cycle) is safe and just re-validates rather than re-scrambling already-synthetic values.
 
-**Sensitive mapping table lifecycle.** `obf_UserObfuscationMapping.OriginalUserID` is real PII and must not sit indefinitely in the lower environment. Two supported modes, chosen by the DBA at run time via a parameter to `obf_sp_obfuscate_database()`:
-- **Retain** (for future delta syncs) — keep the mapping table, but move it to a schema/database with tighter access controls than the general lower-environment schema.
-- **Purge** — after validation passes, `obf_sp_purge_sensitive_staging()` truncates `OriginalUserID` values (replacing with `NULL` or dropping the column's data) while preserving `ObfuscatedUserID`, so future re-runs would generate fresh mappings rather than reuse history.
+**Sensitive mapping table lifecycle.** `obf_UserObfuscationMapping.OriginalUserID` is real PII and must not sit indefinitely accessible in the lower environment. Being in `obf_admin` rather than the target schema already narrows its exposure to whoever has access to the admin schema (now shared across every target obfuscated from this install, so its own access needs to be tighter than any individual target's — see below), and two supported modes, chosen by the DBA at run time via a parameter to `obf_sp_obfuscate_database()`, further reduce it:
+- **Retain** (for future delta syncs) — keep the mapping table, but restrict `SELECT` access on `obf_UserObfuscationMapping` (and ideally the whole `obf_admin` schema) more tightly than the general lower-environment schemas.
+- **Purge** — after validation passes, `obf_sp_purge_sensitive_staging()` overwrites `OriginalUserID` with a non-reversible placeholder (it can't be set `NULL` — it's part of the primary key) while preserving `ObfuscatedUserID`, so future re-runs would generate fresh mappings rather than reuse history.
 
 ---

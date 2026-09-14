@@ -3,13 +3,18 @@
 Reviewed against a live **MariaDB 10.11.19** instance (Docker), running the fixture and
 every concrete case in `03-Test-Plan.sql`.
 
-> **Status:** all findings (F1–F10) are **fixed** in `02-Implementation.sql` and
-> re-verified — see each finding for the change and its test. A second-pass review after
-> the fixes is in the "Post-fix review" section below (F11–F17); F11 and F12 fixed, the
-> rest are doc-accuracy notes.
+> **Status:** all findings F1–F10 (original review) and F11–F12 (post-fix review) are
+> **fixed** in `02-Implementation.sql` and re-verified; F13–F17 are doc-accuracy notes. The
+> framework was later split into a dedicated `obf_admin` schema with multi-target support
+> — see "Admin-schema migration review" at the bottom for that pass's findings (M1–M3, all
+> fixed).
 >
-> The whole plan runs as 49 assertions via `bash test/run-all.sh` (drops the schema,
-> reloads `02-Implementation.sql`, exercises Tests 1–15) — currently **49/49 pass**.
+> The whole plan runs as assertions via `bash test/run-all.sh` (drops the admin schema and
+> a target database, reloads `02-Implementation.sql`, exercises Tests 1–19, including a
+> dedicated multi-target isolation test) — currently **63/63 pass**. (Historical note: this
+> banner read 49/49 against the pre-migration, single-schema version of the framework —
+> see individual findings below for their original verification counts, which remain
+> accurate for what they tested at the time.)
 
 ## Test results at a glance
 
@@ -429,3 +434,80 @@ All 15 tests / 49 assertions in `test/run-all.sh` pass on a virgin load.
 | F17 | design (deferred) | §C twice flags "make the reference-column type check fatal in `obf_sp_validate_config`" as a follow-up — still accurate; today it is a WARN in `obf_sp_discover_user_references` only. |
 
 Doc-accuracy fixes already applied to `01-Design-and-Architecture.md`: component list ("five" → the table; added `obf_FkConstraintBackup`), `Synthetic*` table names, and §C "Case sensitivity / collation" rewritten to match F11.
+
+---
+
+## Admin-schema migration review (M1–M3)
+
+Third pass, after splitting the framework out of the target schema into a dedicated
+`obf_admin` schema with multi-target support (every entry point now takes
+`p_target_schema` as its first argument; every admin-side state table carries a
+`TargetSchema` column). Verified in a disposable two-schema Docker container before
+rollout, then rolled out live against a real ~370-table Appian schema (`appiandev2`,
+727 registered reference columns, 113 configured PII columns across 22 tables).
+`test/run-all.sh` grew from 15 tests / 49 assertions to **19 tests / 63 assertions**,
+including a new dedicated multi-target isolation test (TEST 19: two target schemas
+obfuscated from one admin install, asserts zero cross-target bleed in mapping/config/run
+history).
+
+### M1 — Unqualified cross-schema references would have silently resolved wrong *(critical, caught before merge)*
+
+MariaDB resolves an **unqualified** table/routine reference inside a stored routine's body
+against the **caller's current default schema at CALL time**, not the schema the routine
+was defined in. A naive split (just moving the `CREATE TABLE`/`CREATE PROCEDURE`
+statements into `obf_admin` without also re-qualifying every reference inside every
+procedure body) would have compiled and loaded without error, then either failed at
+runtime (`Table 'target_db.obf_ObfuscationConfig' doesn't exist`) or, worse, silently
+touched the wrong same-named table if one happened to exist in the caller's current
+schema. Every one of the ~35 objects' internal references — including calls between
+`obf_sp_*` procedures themselves — needed the `` `obf_admin`. `` qualifier; every
+target-table reference needed `p_target_schema` threaded through, requiring the small
+number of previously-*static* `dap_User` statements (5 in `obf_sp_create_user_mapping`,
+1 each in `obf_sp_obfuscate_user_table` and `obf_sp_validate_obfuscation`) to become
+dynamic SQL, since MariaDB only allows a variable to appear as part of a table identifier
+via `PREPARE`/`EXECUTE`. Verified by loading `02-Implementation.sql` from a **neutral**
+starting connection (no `USE` at all) into a fresh container and confirming all 11 tables
+/ 7 functions / 18 procedures land in `obf_admin` and nowhere else, then running the full
+suite against two independently-created target schemas.
+
+### M2 — "Start fresh" during rollout breaks post-hoc validation of already-obfuscated data *(caught live, documented — not a code defect)*
+
+Rolling out against `appiandev2` (already obfuscated under the old single-schema
+framework), the operator chose not to migrate the old run history / mapping data into the
+new `obf_admin` schema. Calling `obf_sp_validate_obfuscation('appiandev2', UUID())`
+afterward raised — every reference-column value it found is real (already obfuscated,
+independently spot-checked as `980/980` obfuscated `dap_User.UserID`s), but the check
+"is this a *known* obfuscated id" is only answerable via `obf_UserObfuscationMapping`,
+which is empty for this target under the fresh admin schema. This is expected, not a bug:
+`obf_sp_validate_obfuscation` is a read-only check (confirmed no data was touched by the
+call), and the new admin schema doesn't need to be able to re-derive a *past* run's
+correctness — it's ready for the *next* refresh cycle, which will build its own mapping
+from scratch against fresh production data. Worth noting in the runbook (done) so a future
+operator doing the same "drop old framework, start fresh under the new admin schema"
+migration isn't alarmed by the same spurious `SIGNAL`.
+
+### M3 — Real-world rollout surfaced two pre-existing environment defects, unrelated to the framework *(informational)*
+
+Applying the migrated framework to `appiandev2` (real Appian schema, not the toy fixture)
+surfaced two problems that were already latent in that lower-environment copy, independent
+of obfuscation:
+- **10 audit columns narrower than the obfuscated-id ceiling** (`VARCHAR(50)` against a
+  57-character requirement at the time) — this is what motivated capping the generated id
+  at 49 characters (see F-equivalent fix in `02-Implementation.sql`'s
+  `obf_fn_generate_obfuscated_email`, documented in `01-Design-and-Architecture.md` §C
+  "Obfuscated-id length ceiling") rather than requiring a schema change.
+- **33 triggers calling 10 stored procedures/functions that don't exist anywhere in
+  `appiandev2`** (e.g. `DAP_Update_rpt_Clock`) — meaning any plain `UPDATE`/`INSERT` on
+  11 core tables already failed in this lower-environment copy, independent of
+  obfuscation. Not a framework defect; the operator chose to permanently drop the 33 dead
+  triggers from `appiandev2` (exact definitions backed up first) rather than have the
+  framework work around them.
+- **7 tables with an obvious unique row-id column that was never declared as a
+  `PRIMARY KEY`** (`acp_Referee.RefereeID`, `cmncontact.id`, etc.) — this is what motivated
+  `obf_TableSeedOverride` (see "Tables with no formal PRIMARY KEY" in
+  `01-Design-and-Architecture.md` §C) rather than requiring a schema change to add PKs.
+
+None of these are framework bugs; they're documented here because the review process that
+surfaced them (systematically working through real error messages against real data,
+rather than only the synthetic fixture) is what makes this a legitimate second/third-pass
+review rather than a rubber stamp.
