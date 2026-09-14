@@ -30,8 +30,8 @@ INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName) VALUES
   ('john@test.com', 'john@test.com', 'John', 'Smith'),
   ('jane@test.com', 'john@test.com', 'Jane', 'Smith');
 
-DELETE FROM ObfuscationConfig;
-INSERT INTO ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
+DELETE FROM obf_ObfuscationConfig;
+INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
   ('dap_User',  'FirstName',  'FIRST_NAME'),
   ('dap_User',  'LastName',   'LAST_NAME'),
   ('dap_User',  'PhoneNumber','PHONE'),

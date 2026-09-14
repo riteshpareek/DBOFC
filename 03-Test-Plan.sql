@@ -29,7 +29,7 @@
 -- INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName) VALUES
 --   ('john@test.com', 'john@test.com', 'John', 'Smith'),
 --   ('jane@test.com', 'john@test.com', 'Jane', 'Smith');
--- INSERT INTO ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
+-- INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
 --   ('dap_User',  'FirstName', 'FIRST_NAME'), ('dap_User',  'LastName', 'LAST_NAME'),
 --   ('dap_User',  'PhoneNumber','PHONE'),     ('dap_User',  'Address',  'ADDRESS'),
 --   ('dap_Actor', 'FirstName', 'FIRST_NAME'), ('dap_Actor', 'LastName', 'LAST_NAME');
@@ -39,22 +39,22 @@
 --   Same input -> same output, every time.
 -- ---------------------------------------------------------------------
 SELECT
-    fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_1,
-    fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_2,
-    fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) =
-    fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS is_deterministic;
+    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_1,
+    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_2,
+    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) =
+    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS is_deterministic;
 -- EXPECT: run_1 = run_2, is_deterministic = 1
 
 -- Different input -> (near-certainly) different output.
 SELECT
-    fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) <>
-    fn_generate_obfuscated_email('jane@test.com', 'test-salt', 0, 40) AS differs_by_input;
+    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) <>
+    obf_fn_generate_obfuscated_email('jane@test.com', 'test-salt', 0, 40) AS differs_by_input;
 -- EXPECT: differs_by_input = 1
 
 -- ---------------------------------------------------------------------
 -- TEST 2: Full run + referential integrity
 -- ---------------------------------------------------------------------
-CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 
 -- No dap_Actor.UserID should be left pointing at a non-existent dap_User.UserID
 SELECT COUNT(*) AS orphaned_actor_rows
@@ -116,7 +116,7 @@ SELECT SHA2(GROUP_CONCAT(UserID, FirstName, LastName, PhoneNumber, Address ORDER
 FROM dap_User;
 -- (capture this value)
 
-CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 
 SELECT SHA2(GROUP_CONCAT(UserID, FirstName, LastName, PhoneNumber, Address ORDER BY UserID), 256) AS state_after
 FROM dap_User;
@@ -129,89 +129,89 @@ FROM dap_User;
 --   user, then confirm the retry logic (attempt 1+) produces a
 --   different, still-deterministic value instead of failing.
 -- ---------------------------------------------------------------------
--- SET @collide_target = fn_generate_obfuscated_email('newuser@test.com', 'test-salt-001', 0, 40);
--- INSERT INTO UserObfuscationMapping (OriginalUserID, ObfuscatedUserID, CreatedDate)
+-- SET @collide_target = obf_fn_generate_obfuscated_email('newuser@test.com', 'test-salt-001', 0, 40);
+-- INSERT INTO obf_UserObfuscationMapping (OriginalUserID, ObfuscatedUserID, CreatedDate)
 --   VALUES ('someone-else@test.com', @collide_target, NOW());
 -- INSERT INTO dap_User (UserID, FirstName, LastName) VALUES ('newuser@test.com', 'New', 'User');
--- CALL sp_create_user_mapping(UUID(), 'test-salt-001');
--- SELECT * FROM UserObfuscationMapping WHERE OriginalUserID = 'newuser@test.com';
+-- CALL obf_sp_create_user_mapping(UUID(), 'test-salt-001');
+-- SELECT * FROM obf_UserObfuscationMapping WHERE OriginalUserID = 'newuser@test.com';
 -- EXPECT: a row exists, with ObfuscatedUserID <> @collide_target (attempt 1 value used)
 
 -- ---------------------------------------------------------------------
 -- TEST 8: Failure handling — bad config is rejected before any data changes
 -- ---------------------------------------------------------------------
--- INSERT INTO ObfuscationConfig (TableName, ColumnName, ObfuscationType)
+-- INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType)
 --   VALUES ('dap_User', 'NoSuchColumn', 'STATIC');
--- CALL sp_obfuscate_database('test-salt-002', 10000, FALSE);
--- EXPECT: procedure raises SQLSTATE 45000 from sp_validate_config, and
--- ObfuscationRunLog shows an ERROR row for sp_validate_config with no
+-- CALL obf_sp_obfuscate_database('test-salt-002', 10000, FALSE);
+-- EXPECT: procedure raises SQLSTATE 45000 from obf_sp_validate_config, and
+-- obf_ObfuscationRunLog shows an ERROR row for obf_sp_validate_config with no
 -- subsequent OK rows for later steps (i.e. it stopped before mutating data).
--- DELETE FROM ObfuscationConfig WHERE ColumnName = 'NoSuchColumn'; -- cleanup
+-- DELETE FROM obf_ObfuscationConfig WHERE ColumnName = 'NoSuchColumn'; -- cleanup
 
 -- ---------------------------------------------------------------------
 -- TEST 9: Validation catches a deliberately broken state
 -- ---------------------------------------------------------------------
 -- INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName)
 --   VALUES ('nonexistent-obfuscated-value@example.invalid', NULL, 'X', 'Y');
--- CALL sp_validate_obfuscation(UUID());
--- EXPECT: SQLSTATE 45000 raised, ObfuscationRunLog shows the orphan count for dap_Actor.UserID.
+-- CALL obf_sp_validate_obfuscation(UUID());
+-- EXPECT: SQLSTATE 45000 raised, obf_ObfuscationRunLog shows the orphan count for dap_Actor.UserID.
 -- DELETE FROM dap_Actor WHERE UserID = 'nonexistent-obfuscated-value@example.invalid'; -- cleanup
 
 -- ---------------------------------------------------------------------
 -- TEST 10: Orphan user-reference values (pre-existing values in a
 --   NAMING_CONVENTION / MANUAL column that match no dap_User.UserID).
 --   The framework must (a) report them BEFORE mutating anything, and
---   (b) handle them per UserReferenceRegistry.OrphanAction so no
+--   (b) handle them per obf_UserReferenceRegistry.OrphanAction so no
 --   original value is left behind and the run does NOT false-fail.
 -- ---------------------------------------------------------------------
 -- Assumes the TEST 0 fixture, freshly reset (no prior obfuscation).
 
 -- 10a. OBFUSCATE (default): stray value is mapped + replaced, run succeeds.
 -- UPDATE dap_Actor SET CreatedBy = 'ghost-user@test.com' WHERE ActorID = 1;
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 -- EXPECT: run returns a RunID (no SQLSTATE 45000); the CALL emits a
 --   diagnostic result set listing (dap_Actor, CreatedBy, 'ghost-user@test.com', 1)
---   from sp_report_orphan_user_references; ObfuscationRunLog has a
---   sp_report_orphan_user_references 'WARN' row followed by
---   sp_resolve_orphan_user_references 'OK' rows.
+--   from obf_sp_report_orphan_user_references; obf_ObfuscationRunLog has a
+--   obf_sp_report_orphan_user_references 'WARN' row followed by
+--   obf_sp_resolve_orphan_user_references 'OK' rows.
 -- SELECT COUNT(*) AS ghost_remaining FROM dap_Actor WHERE CreatedBy = 'ghost-user@test.com';
 -- EXPECT: 0
 -- SELECT COUNT(*) AS createdby_all_known_obf
---   FROM dap_Actor a JOIN UserObfuscationMapping m ON m.ObfuscatedUserID = a.CreatedBy;
+--   FROM dap_Actor a JOIN obf_UserObfuscationMapping m ON m.ObfuscatedUserID = a.CreatedBy;
 -- EXPECT: equals the number of non-null CreatedBy rows
 
 -- 10b. NULLIFY: stray value is set NULL instead of mapped.
 -- (reset fixture)
 -- UPDATE dap_Actor SET CreatedBy = 'ghost-user@test.com' WHERE ActorID = 1;
--- CALL sp_discover_user_references(UUID());
--- UPDATE UserReferenceRegistry SET OrphanAction = 'NULLIFY'
+-- CALL obf_sp_discover_user_references(UUID());
+-- UPDATE obf_UserReferenceRegistry SET OrphanAction = 'NULLIFY'
 --   WHERE TableName = 'dap_Actor' AND ColumnName = 'CreatedBy';
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 -- SELECT CreatedBy FROM dap_Actor WHERE ActorID = 1;   -- EXPECT: NULL
 -- EXPECT: run succeeds.
 
 -- 10c. IGNORE: stray sentinel kept, run succeeds, validation does not flag it.
 -- (reset fixture)
 -- UPDATE dap_Actor SET CreatedBy = 'SYSTEM' WHERE ActorID = 1;
--- CALL sp_discover_user_references(UUID());
--- UPDATE UserReferenceRegistry SET OrphanAction = 'IGNORE'
+-- CALL obf_sp_discover_user_references(UUID());
+-- UPDATE obf_UserReferenceRegistry SET OrphanAction = 'IGNORE'
 --   WHERE TableName = 'dap_Actor' AND ColumnName = 'CreatedBy';
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 -- SELECT COUNT(*) AS sentinel_kept FROM dap_Actor WHERE CreatedBy = 'SYSTEM';  -- EXPECT: 1
--- EXPECT: run succeeds; ObfuscationRunLog shows sp_resolve_orphan_user_references
---   and sp_validate_obfuscation 'SKIP' rows for dap_Actor.CreatedBy, and
+-- EXPECT: run succeeds; obf_ObfuscationRunLog shows obf_sp_resolve_orphan_user_references
+--   and obf_sp_validate_obfuscation 'SKIP' rows for dap_Actor.CreatedBy, and
 --   'Validation passed.'
 
 -- 10d. Idempotency with a stray present (OBFUSCATE): run 2-3x, confirm the
 --   synthesised mapping row count and every obfuscated value are stable.
 
 -- ---------------------------------------------------------------------
--- TEST 11: sp_validate_config — UNIQUE constraints & type compatibility
+-- TEST 11: obf_sp_validate_config — UNIQUE constraints & type compatibility
 -- ---------------------------------------------------------------------
 -- 11a. A UNIQUE index on a configured column is flagged (WARN), run proceeds.
 -- ALTER TABLE dap_User ADD CONSTRAINT UQ_User_Phone UNIQUE (PhoneNumber);
--- CALL sp_validate_config(UUID());
--- EXPECT: ObfuscationRunLog has a sp_validate_config 'WARN' row naming
+-- CALL obf_sp_validate_config(UUID());
+-- EXPECT: obf_ObfuscationRunLog has a obf_sp_validate_config 'WARN' row naming
 --   dap_User.PhoneNumber / UQ_User_Phone; the CALL also returns a diagnostic
 --   result set of unique-indexed configured columns; no SQLSTATE raised.
 
@@ -220,109 +220,109 @@ FROM dap_User;
 -- ALTER TABLE dap_User ADD COLUMN ExternalRef VARCHAR(64);
 -- UPDATE dap_User SET ExternalRef = SUBSTRING_INDEX(UserID,'@',1);  -- distinct
 -- ALTER TABLE dap_User ADD CONSTRAINT UQ_User_ExtRef UNIQUE (ExternalRef);
--- INSERT INTO ObfuscationConfig (TableName,ColumnName,ObfuscationType,StaticValue)
+-- INSERT INTO obf_ObfuscationConfig (TableName,ColumnName,ObfuscationType,StaticValue)
 --   VALUES ('dap_User','ExternalRef','STATIC','REDACTED');
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- EXPECT: SQLSTATE 45000 from sp_validate_config; dap_User.ExternalRef and all
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: SQLSTATE 45000 from obf_sp_validate_config; dap_User.ExternalRef and all
 --   other columns unchanged (it stopped before any mutation).
 
 -- 11c. A numeric reference column is flagged as type-incompatible.
 -- (reset fixture)
 -- CREATE TABLE dap_Widget (WidgetID BIGINT PRIMARY KEY AUTO_INCREMENT, CreatedBy BIGINT);
 -- INSERT INTO dap_Widget (CreatedBy) VALUES (101),(102);
--- CALL sp_discover_user_references(UUID());
--- EXPECT: sp_discover_user_references 'WARN' row; its diagnostic result set shows
+-- CALL obf_sp_discover_user_references(UUID());
+-- EXPECT: obf_sp_discover_user_references 'WARN' row; its diagnostic result set shows
 --   dap_Widget.CreatedBy with TypeLooksCompatible = 0.
 
 -- ---------------------------------------------------------------------
--- TEST 12: sp_validate_obfuscation — reconciliation & residual-PII
+-- TEST 12: obf_sp_validate_obfuscation — reconciliation & residual-PII
 -- ---------------------------------------------------------------------
 -- 12a. Clean run records BEFORE/AFTER snapshots and both checks pass.
 -- (reset fixture)
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- SELECT * FROM ObfuscationRowCountSnapshot WHERE RunID = <that RunID>;
--- EXPECT: BEFORE and AFTER rows per table, equal counts; ObfuscationRunLog shows
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- SELECT * FROM obf_ObfuscationRowCountSnapshot WHERE RunID = <that RunID>;
+-- EXPECT: BEFORE and AFTER rows per table, equal counts; obf_ObfuscationRunLog shows
 --   'Row-count reconciliation passed' and 'Residual-PII spot checks passed'.
 
 -- 12b. A row-count change during the run is caught.
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);  -- capture @rid
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);  -- capture @rid
 -- DELETE FROM dap_Actor WHERE ActorID = 2;                    -- simulate a trigger/bug
--- CALL sp_validate_obfuscation(@rid);
+-- CALL obf_sp_validate_obfuscation(@rid);
 -- EXPECT: SQLSTATE 45000; log line 'Row count changed: dap_Actor before=2 after=1'.
 
 -- 12c. A real value left behind in a configured column is caught.
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);  -- capture @rid
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);  -- capture @rid
 -- UPDATE dap_User SET FirstName = 'Zoltan' WHERE UserID LIKE '%@example.invalid' LIMIT 1;
--- CALL sp_validate_obfuscation(@rid);
+-- CALL obf_sp_validate_obfuscation(@rid);
 -- EXPECT: SQLSTATE 45000; log line names dap_User.FirstName (FIRST_NAME) as residual PII.
 
 -- 12d. Standalone call with no BEFORE snapshot skips reconciliation (does not fail on it).
--- CALL sp_validate_obfuscation(UUID());   -- on an otherwise-clean obfuscated DB
+-- CALL obf_sp_validate_obfuscation(UUID());   -- on an otherwise-clean obfuscated DB
 -- EXPECT: 'Row-count reconciliation skipped — no BEFORE snapshot' log row; proc
 --   returns without error (unless 10a/10c find a real problem).
 
 -- ---------------------------------------------------------------------
 -- TEST 13: Run-state tracking & resume after a partial failure
 -- ---------------------------------------------------------------------
--- 13a. Clean run records an ObfuscationRun row.
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- CALL sp_obfuscation_status();
--- EXPECT: ObfuscationRun row Status='COMPLETED' with the salt; sp_obfuscation_status
+-- 13a. Clean run records an obf_ObfuscationRun row.
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- CALL obf_sp_obfuscation_status();
+-- EXPECT: obf_ObfuscationRun row Status='COMPLETED' with the salt; obf_sp_obfuscation_status
 --   Assessment = 'Last run COMPLETED cleanly...'; zero FK constraints dropped.
 
 -- 13b. A failure between FK-drop and FK-restore leaves a visible half-migrated state.
 -- (reset fixture)
--- CALL sp_discover_user_references(UUID());
--- UPDATE UserReferenceRegistry SET OrphanAction='IGNORE'
+-- CALL obf_sp_discover_user_references(UUID());
+-- UPDATE obf_UserReferenceRegistry SET OrphanAction='IGNORE'
 --   WHERE TableName='dap_Actor' AND ColumnName='UserID';           -- so the bad row is not fixed up
 -- SET FOREIGN_KEY_CHECKS=0;
 -- INSERT INTO dap_Actor (UserID,CreatedBy,FirstName,LastName)
 --   VALUES ('orphan-no-parent@x.com',NULL,'A','B');                -- FK-restore will reject this
 -- SET FOREIGN_KEY_CHECKS=1;
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- EXPECT: SQLSTATE 23000; ObfuscationRun row Status='FAILED' with ErrorSqlState='23000'
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: SQLSTATE 23000; obf_ObfuscationRun row Status='FAILED' with ErrorSqlState='23000'
 --   and the real FK message in ErrorText; FK_Actor_User absent from
---   information_schema.TABLE_CONSTRAINTS; sp_obfuscation_status Assessment starts
+--   information_schema.TABLE_CONSTRAINTS; obf_sp_obfuscation_status Assessment starts
 --   'HALF-MIGRATED'.
 
 -- 13c. Fix the cause and resume with the SAME salt.
 -- DELETE FROM dap_Actor WHERE UserID='orphan-no-parent@x.com';
--- UPDATE UserReferenceRegistry SET OrphanAction='OBFUSCATE'
+-- UPDATE obf_UserReferenceRegistry SET OrphanAction='OBFUSCATE'
 --   WHERE TableName='dap_Actor' AND ColumnName='UserID';
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- EXPECT: run succeeds; ObfuscationRunLog shows a sp_obfuscate_database 'WARN'
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: run succeeds; obf_ObfuscationRunLog shows a obf_sp_obfuscate_database 'WARN'
 --   ('Resuming after an interrupted/failed run...'); FK_Actor_User restored;
---   sp_obfuscation_status Assessment = 'Last run COMPLETED cleanly...'; the earlier
---   FAILED row is retained in ObfuscationRun for audit.
+--   obf_sp_obfuscation_status Assessment = 'Last run COMPLETED cleanly...'; the earlier
+--   FAILED row is retained in obf_ObfuscationRun for audit.
 
 -- ---------------------------------------------------------------------
 -- TEST 14: Robustness / housekeeping (F7, F8, F9)
 -- ---------------------------------------------------------------------
 -- 14a. F7 — synthetic pickers work with non-contiguous / non-zero-based SeedID.
--- DELETE FROM SyntheticFirstName;
--- INSERT INTO SyntheticFirstName (SeedID,NameValue) VALUES (10,'Alta'),(25,'Bruno'),(500,'Dara'),(9999,'Cleo');
--- DELETE FROM SyntheticLastName;
--- INSERT INTO SyntheticLastName  (SeedID,NameValue) VALUES (3,'Kade'),(77,'Loom'),(1201,'Mira');
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- DELETE FROM obf_SyntheticFirstName;
+-- INSERT INTO obf_SyntheticFirstName (SeedID,NameValue) VALUES (10,'Alta'),(25,'Bruno'),(500,'Dara'),(9999,'Cleo');
+-- DELETE FROM obf_SyntheticLastName;
+-- INSERT INTO obf_SyntheticLastName  (SeedID,NameValue) VALUES (3,'Kade'),(77,'Loom'),(1201,'Mira');
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 -- EXPECT: no NULL FirstName/LastName; every value is from the pool; a second run
 --   with the same salt leaves them unchanged (deterministic).
 
--- 14b. F8 — FkConstraintBackup does not grow; sp_obfuscation_prune trims history.
--- CALL sp_obfuscate_database('t1',10000,FALSE);
--- CALL sp_obfuscate_database('t2',10000,FALSE);
--- CALL sp_obfuscate_database('t3',10000,FALSE);
--- SELECT COUNT(*) FROM FkConstraintBackup;              -- EXPECT: 1 (not 3)
--- SELECT RunID IS NOT NULL FROM FkConstraintBackup;     -- EXPECT: RunID stamped
--- CALL sp_obfuscation_prune(1);
--- SELECT COUNT(*) FROM ObfuscationRun;                  -- EXPECT: 1
--- SELECT COUNT(DISTINCT RunID) FROM ObfuscationRunLog;  -- EXPECT: 1
--- CALL sp_obfuscation_prune(0);                         -- EXPECT: SQLSTATE 45000
+-- 14b. F8 — obf_FkConstraintBackup does not grow; obf_sp_obfuscation_prune trims history.
+-- CALL obf_sp_obfuscate_database('t1',10000,FALSE);
+-- CALL obf_sp_obfuscate_database('t2',10000,FALSE);
+-- CALL obf_sp_obfuscate_database('t3',10000,FALSE);
+-- SELECT COUNT(*) FROM obf_FkConstraintBackup;              -- EXPECT: 1 (not 3)
+-- SELECT RunID IS NOT NULL FROM obf_FkConstraintBackup;     -- EXPECT: RunID stamped
+-- CALL obf_sp_obfuscation_prune(1);
+-- SELECT COUNT(*) FROM obf_ObfuscationRun;                  -- EXPECT: 1
+-- SELECT COUNT(DISTINCT RunID) FROM obf_ObfuscationRunLog;  -- EXPECT: 1
+-- CALL obf_sp_obfuscation_prune(0);                         -- EXPECT: SQLSTATE 45000
 
 -- 14c. F9 — EMAIL type never double-suffixes.
 -- ALTER TABLE dap_User ADD COLUMN AltEmail VARCHAR(254);
 -- UPDATE dap_User SET AltEmail = CONCAT('alt.', SUBSTRING_INDEX(UserID,'@',1), '@corp.example');
--- INSERT INTO ObfuscationConfig (TableName,ColumnName,ObfuscationType) VALUES ('dap_User','AltEmail','EMAIL');
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- INSERT INTO obf_ObfuscationConfig (TableName,ColumnName,ObfuscationType) VALUES ('dap_User','AltEmail','EMAIL');
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
 -- SELECT COUNT(*) FROM dap_User WHERE AltEmail LIKE '%@example.invalid@example.invalid%';   -- EXPECT: 0
 -- SELECT COUNT(*) FROM dap_User WHERE AltEmail RLIKE '^user_[0-9a-f]{16}@example\\.invalid$';-- EXPECT: all rows
 -- EXPECT: a second run with the same salt leaves AltEmail unchanged.
@@ -335,25 +335,36 @@ FROM dap_User;
 -- ---------------------------------------------------------------------
 -- 15a. A mixed-case value in a reference column links to the right user.
 -- UPDATE dap_Actor SET CreatedBy = 'JOHN@TEST.COM' WHERE ActorID = 1;   -- same user, upper case
--- CALL sp_obfuscate_database('test-salt-001', 10000, FALSE);
--- SELECT COUNT(*) FROM UserObfuscationMapping WHERE OriginalUserID <> LOWER(OriginalUserID);  -- EXPECT: 0
--- SELECT COUNT(*) FROM UserObfuscationMapping;                                                -- EXPECT: 3 (no spurious 4th)
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE OriginalUserID <> LOWER(OriginalUserID);  -- EXPECT: 0
+-- SELECT COUNT(*) FROM obf_UserObfuscationMapping;                                                -- EXPECT: 3 (no spurious 4th)
 -- SELECT a.CreatedBy = m.ObfuscatedUserID
---   FROM dap_Actor a JOIN UserObfuscationMapping m ON m.OriginalUserID='john@test.com' WHERE a.ActorID=1;  -- EXPECT: 1
+--   FROM dap_Actor a JOIN obf_UserObfuscationMapping m ON m.OriginalUserID='john@test.com' WHERE a.ActorID=1;  -- EXPECT: 1
 
 -- 15b. Under a case-sensitive collation, case-only duplicate UserIDs are rejected.
 -- ALTER TABLE dap_Actor DROP FOREIGN KEY FK_Actor_User;
 -- ALTER TABLE dap_User MODIFY UserID VARCHAR(255) COLLATE utf8mb4_bin;
 -- INSERT INTO dap_User (UserID,FirstName,LastName) VALUES ('John@dup.com','J','D'),('john@dup.com','j','d');
--- CALL sp_create_user_mapping(UUID(),'test-salt-001');
+-- CALL obf_sp_create_user_mapping(UUID(),'test-salt-001');
 -- EXPECT: SQLSTATE 45000 ('dap_User.UserID has case-only duplicate values.').
+
+-- ---------------------------------------------------------------------
+-- TEST 16: A reference column too narrow for the obfuscated user id is
+--   caught pre-flight, before any destructive step (FK drop included).
+-- ---------------------------------------------------------------------
+-- (reset fixture)
+-- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(20);   -- narrower than the obfuscated email needs
+-- CALL obf_sp_obfuscate_database('test-salt-001', 10000, FALSE);
+-- EXPECT: SQLSTATE 45000 from obf_sp_validate_reference_column_lengths; FK_Actor_User
+--   still present in information_schema.TABLE_CONSTRAINTS (nothing destructive ran);
+--   obf_ObfuscationRunLog names dap_Actor.CreatedBy with its current/required length.
 
 -- ---------------------------------------------------------------------
 -- Review the full run history at any point:
 -- ---------------------------------------------------------------------
-SELECT * FROM ObfuscationRunLog ORDER BY LogID;
-SELECT * FROM ObfuscationRun    ORDER BY StartedAt;
--- CALL sp_obfuscation_status();
+SELECT * FROM obf_ObfuscationRunLog ORDER BY LogID;
+SELECT * FROM obf_ObfuscationRun    ORDER BY StartedAt;
+-- CALL obf_sp_obfuscation_status();
 
 -- ---------------------------------------------------------------------
 -- Or drive the whole plan as assertions:  bash test/run-all.sh

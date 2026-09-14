@@ -5,13 +5,13 @@ DROP TABLE IF EXISTS dap_Actor;
 DROP TABLE IF EXISTS dap_User;
 SET FOREIGN_KEY_CHECKS = 1;
 
-TRUNCATE TABLE UserObfuscationMapping;
-TRUNCATE TABLE UserReferenceRegistry;
-TRUNCATE TABLE FkConstraintBackup;
-TRUNCATE TABLE ObfuscationRunLog;
-TRUNCATE TABLE ObfuscationConfig;
-TRUNCATE TABLE ObfuscationRun;
-TRUNCATE TABLE ObfuscationRowCountSnapshot;
+TRUNCATE TABLE obf_UserObfuscationMapping;
+TRUNCATE TABLE obf_UserReferenceRegistry;
+TRUNCATE TABLE obf_FkConstraintBackup;
+TRUNCATE TABLE obf_ObfuscationRunLog;
+TRUNCATE TABLE obf_ObfuscationConfig;
+TRUNCATE TABLE obf_ObfuscationRun;
+TRUNCATE TABLE obf_ObfuscationRowCountSnapshot;
 
 CREATE TABLE dap_User (
     UserID      VARCHAR(255) PRIMARY KEY,
@@ -39,7 +39,7 @@ INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName) VALUES
   ('john@test.com', 'john@test.com', 'John', 'Smith'),
   ('jane@test.com', 'john@test.com', 'Jane', 'Smith');
 
-INSERT INTO ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
+INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
   ('dap_User',  'FirstName',  'FIRST_NAME'),
   ('dap_User',  'LastName',   'LAST_NAME'),
   ('dap_User',  'PhoneNumber','PHONE'),
