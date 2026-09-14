@@ -1,5 +1,7 @@
 -- Disposable fixture for exercising the obfuscation framework.
-USE Appian;
+-- Run this against the TARGET schema (e.g. `USE Appian;` first) -- it only
+-- creates the application-side tables. The obf_ObfuscationConfig rows now
+-- live in the admin schema; see test/run-all.sh for how they're seeded.
 
 DROP TABLE IF EXISTS dap_Actor;
 DROP TABLE IF EXISTS dap_User;
@@ -29,12 +31,3 @@ INSERT INTO dap_User (UserID, FirstName, LastName, PhoneNumber, Address) VALUES
 INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName) VALUES
   ('john@test.com', 'john@test.com', 'John', 'Smith'),
   ('jane@test.com', 'john@test.com', 'Jane', 'Smith');
-
-DELETE FROM obf_ObfuscationConfig;
-INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
-  ('dap_User',  'FirstName',  'FIRST_NAME'),
-  ('dap_User',  'LastName',   'LAST_NAME'),
-  ('dap_User',  'PhoneNumber','PHONE'),
-  ('dap_User',  'Address',    'ADDRESS'),
-  ('dap_Actor', 'FirstName',  'FIRST_NAME'),
-  ('dap_Actor', 'LastName',   'LAST_NAME');

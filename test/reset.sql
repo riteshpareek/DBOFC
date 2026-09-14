@@ -1,17 +1,11 @@
--- Full reset: framework state + fixture, for a clean test run.
-USE Appian;
+-- Target-schema reset: drops/recreates the fixture application tables only.
+-- Run this against the TARGET schema. The companion admin-schema reset
+-- (obf_* rows scoped to this TargetSchema) lives in test/run-all.sh, since
+-- the target schema name is only known there.
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS dap_Actor;
 DROP TABLE IF EXISTS dap_User;
 SET FOREIGN_KEY_CHECKS = 1;
-
-TRUNCATE TABLE obf_UserObfuscationMapping;
-TRUNCATE TABLE obf_UserReferenceRegistry;
-TRUNCATE TABLE obf_FkConstraintBackup;
-TRUNCATE TABLE obf_ObfuscationRunLog;
-TRUNCATE TABLE obf_ObfuscationConfig;
-TRUNCATE TABLE obf_ObfuscationRun;
-TRUNCATE TABLE obf_ObfuscationRowCountSnapshot;
 
 CREATE TABLE dap_User (
     UserID      VARCHAR(255) PRIMARY KEY,
@@ -38,11 +32,3 @@ INSERT INTO dap_User (UserID, FirstName, LastName, PhoneNumber, Address) VALUES
 INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName) VALUES
   ('john@test.com', 'john@test.com', 'John', 'Smith'),
   ('jane@test.com', 'john@test.com', 'Jane', 'Smith');
-
-INSERT INTO obf_ObfuscationConfig (TableName, ColumnName, ObfuscationType) VALUES
-  ('dap_User',  'FirstName',  'FIRST_NAME'),
-  ('dap_User',  'LastName',   'LAST_NAME'),
-  ('dap_User',  'PhoneNumber','PHONE'),
-  ('dap_User',  'Address',    'ADDRESS'),
-  ('dap_Actor', 'FirstName',  'FIRST_NAME'),
-  ('dap_Actor', 'LastName',   'LAST_NAME');
