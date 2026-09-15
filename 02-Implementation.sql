@@ -89,14 +89,34 @@ CREATE TABLE IF NOT EXISTS obf_admin.obf_TableSeedOverride (
     PRIMARY KEY (TargetSchema, TableName)
 ) ENGINE=InnoDB;
 
+-- OriginalUserID / ObfuscatedUserID are pinned to COLLATE utf8mb4_general_ci
+-- -- the exact collation every cross-schema comparison against them forces
+-- at query time (see "Cross-schema collation safety" in
+-- 01-Design-and-Architecture.md §C). Without this, the column's collation
+-- would instead default to whatever the server had when this table was
+-- created (its own accident of history, unrelated to any target schema),
+-- and if that ever differs from the forced query-time collation, MariaDB
+-- can no longer use this table's indexes to satisfy the comparison --
+-- every cross-schema join degrades from an indexed lookup to a full linear
+-- scan of every row sharing the same TargetSchema, repeated once per row
+-- of the (often much larger) target-schema table. On a real ~560k-row
+-- table this was the difference between ~2 seconds and not finishing in
+-- 30+ minutes. Pinning the collation here keeps the index usable
+-- regardless of the target schema's own collation or the server's default
+-- at install time.
 CREATE TABLE IF NOT EXISTS obf_admin.obf_UserObfuscationMapping (
     TargetSchema      VARCHAR(128) NOT NULL,
-    OriginalUserID    VARCHAR(255) NOT NULL,
-    ObfuscatedUserID  VARCHAR(255) NOT NULL,
+    OriginalUserID    VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL,
+    ObfuscatedUserID  VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL,
     CreatedDate       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (TargetSchema, OriginalUserID),
     UNIQUE KEY UK_ObfuscatedUserID (TargetSchema, ObfuscatedUserID)
 ) ENGINE=InnoDB;
+-- Upgrade an existing install created before these columns were pinned to a
+-- fixed collation (harmless / instant no-op if already pinned).
+ALTER TABLE obf_admin.obf_UserObfuscationMapping
+    MODIFY COLUMN OriginalUserID   VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL,
+    MODIFY COLUMN ObfuscatedUserID VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL;
 
 -- Captures FK definitions so they can be dropped and restored exactly.
 -- Rows are transient: a row lives only while its constraint is dropped. The
@@ -118,7 +138,7 @@ CREATE TABLE IF NOT EXISTS obf_admin.obf_FkConstraintBackup (
     DroppedDate           DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     RestoredDate          DATETIME      NULL
 ) ENGINE=InnoDB;
-ALTER TABLE obf_admin.obf_FkConstraintBackup ADD COLUMN IF NOT EXISTS RunID CHAR(36) NULL;
+-- ALTER TABLE obf_admin.obf_FkConstraintBackup ADD COLUMN IF NOT EXISTS RunID CHAR(36) NULL;
 
 CREATE TABLE IF NOT EXISTS obf_admin.obf_ObfuscationRunLog (
     LogID        BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -128,6 +148,20 @@ CREATE TABLE IF NOT EXISTS obf_admin.obf_ObfuscationRunLog (
     StepStatus   VARCHAR(20)  NOT NULL,   -- START | OK | SKIP | WARN | ERROR
     Message      VARCHAR(1000) NULL,
     LoggedAt     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- Lightweight, unconditional progress timeline through obf_sp_obfuscate_database
+-- (one row per sub-procedure boundary, regardless of that sub-procedure's own
+-- START/OK/WARN logging above) -- lets a DBA see exactly where a long-running
+-- or interrupted call actually got to, by timestamp, without waiting on
+-- obf_ObfuscationRunLog's own step-level detail. Not scoped by RunID (the
+-- inserts that use it don't have one in scope at every point) -- query by
+-- TargetSchema + LoggedAt instead.
+CREATE TABLE IF NOT EXISTS obf_admin.obf_ObfuscationMilestone (
+    MilestoneID   BIGINT AUTO_INCREMENT PRIMARY KEY,
+    TargetSchema  VARCHAR(128) NOT NULL,
+    MilestoneName VARCHAR(100) NOT NULL,
+    LoggedAt      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
 ) ENGINE=InnoDB;
 
 -- One header row per obf_sp_obfuscate_database() invocation. Because the FK
@@ -168,22 +202,33 @@ CREATE TABLE IF NOT EXISTS obf_admin.obf_ObfuscationRowCountSnapshot (
 -- and sharing gives one place to extend it. SeedID only has to be unique --
 -- the obf_fn_synthetic_* pickers select by ORDER BY SeedID + positional
 -- offset, so gaps or a non-zero start are fine.
+-- NameValue is pinned to COLLATE utf8mb4_general_ci for the same reason as
+-- obf_UserObfuscationMapping above -- the residual-PII check compares it
+-- against a CONVERT(...) USING utf8mb4) COLLATE utf8mb4_general_ci
+-- target-schema expression. Low-stakes here (this table is tiny), but kept
+-- consistent rather than leaving one comparison pinned and another not.
 CREATE TABLE IF NOT EXISTS obf_admin.obf_SyntheticFirstName (
     SeedID     INT PRIMARY KEY,
-    NameValue  VARCHAR(50) NOT NULL
+    NameValue  VARCHAR(50) COLLATE utf8mb4_general_ci NOT NULL
 ) ENGINE=InnoDB;
+ALTER TABLE obf_admin.obf_SyntheticFirstName
+    MODIFY COLUMN NameValue VARCHAR(50) COLLATE utf8mb4_general_ci NOT NULL;
 
 CREATE TABLE IF NOT EXISTS obf_admin.obf_SyntheticLastName (
     SeedID     INT PRIMARY KEY,
-    NameValue  VARCHAR(50) NOT NULL
+    NameValue  VARCHAR(50) COLLATE utf8mb4_general_ci NOT NULL
 ) ENGINE=InnoDB;
+ALTER TABLE obf_admin.obf_SyntheticLastName
+    MODIFY COLUMN NameValue VARCHAR(50) COLLATE utf8mb4_general_ci NOT NULL;
 
 CREATE TABLE IF NOT EXISTS obf_admin.obf_SyntheticStreetAddress (
     SeedID        INT PRIMARY KEY,
-    AddressValue  VARCHAR(255) NOT NULL
+    AddressValue  VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL
 ) ENGINE=InnoDB;
+ALTER TABLE obf_admin.obf_SyntheticStreetAddress
+    MODIFY COLUMN AddressValue VARCHAR(255) COLLATE utf8mb4_general_ci NOT NULL;
 
--- Minimal seed sets — extend as needed for better distribution.
+-- Minimal seed sets - extend as needed for better distribution.
 INSERT IGNORE INTO obf_admin.obf_SyntheticFirstName (SeedID, NameValue) VALUES
  (0,'David'),(1,'Sarah'),(2,'Michael'),(3,'Emma'),(4,'James'),(5,'Olivia'),
  (6,'Daniel'),(7,'Sophie'),(8,'Ryan'),(9,'Grace'),(10,'Thomas'),(11,'Chloe'),
@@ -328,7 +373,7 @@ BEGIN
 END$$
 
 -- Deterministic synthetic phone number. Fixed Australian-style mobile
--- format shown as an example — adjust the literal pattern for your locale.
+-- format shown as an example - adjust the literal pattern for your locale.
 CREATE OR REPLACE FUNCTION obf_admin.obf_fn_synthetic_phone(p_user_key VARCHAR(255), p_max_len INT)
 RETURNS VARCHAR(50)
 DETERMINISTIC
@@ -473,7 +518,7 @@ BEGIN
 
     IF v_fatal > 0 THEN
         SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'obf_ObfuscationConfig has a column whose obfuscation type cannot satisfy a UNIQUE constraint — see obf_ObfuscationRunLog.';
+            SET MESSAGE_TEXT = 'obf_ObfuscationConfig has a column whose obfuscation type cannot satisfy a UNIQUE constraint - see obf_ObfuscationRunLog.';
     END IF;
 
     CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_config', 'OK',
@@ -490,6 +535,8 @@ DELIMITER ;
 DELIMITER $$
 CREATE OR REPLACE PROCEDURE obf_admin.obf_sp_discover_user_references(IN p_target_schema VARCHAR(128), IN p_run_id CHAR(36))
 BEGIN
+    DECLARE v_stale_disabled INT DEFAULT 0;
+
     -- 4a. True foreign keys pointing at dap_User.UserID
     INSERT INTO obf_admin.obf_UserReferenceRegistry (TargetSchema, TableName, ColumnName, DiscoveryMethod, ConstraintName)
     SELECT
@@ -505,7 +552,7 @@ BEGIN
         Enabled = TRUE;
 
     -- 4b. Naming-convention columns (CreatedBy, ModifiedBy, etc.) that are
-    -- NOT already captured as an FK above — these are value copies, not
+    -- NOT already captured as an FK above - these are value copies, not
     -- enforced relationships, so they need a separate discovery path.
     INSERT INTO obf_admin.obf_UserReferenceRegistry (TargetSchema, TableName, ColumnName, DiscoveryMethod, ConstraintName)
     SELECT
@@ -515,12 +562,40 @@ BEGIN
         ON tt.TABLE_SCHEMA = cc.TABLE_SCHEMA AND tt.TABLE_NAME = cc.TABLE_NAME
     WHERE cc.TABLE_SCHEMA = p_target_schema
       AND tt.TABLE_TYPE = 'BASE TABLE'
-      AND cc.COLUMN_NAME IN ('CreatedBy','CreatedUser','CreatedUserID','ModifiedBy','ModifiedUserID')
+      AND cc.COLUMN_NAME IN ('CreatedBy','CreatedUser','CreatedUserID',
+      'ModifiedBy','ModifiedUserID','UpdatedBy', 
+      'RfiCreatedUserID', 'ActivityDateUpdateUserID', 'ActivityDateUpdateUserID')
       AND NOT EXISTS (
           SELECT 1 FROM obf_admin.obf_UserReferenceRegistry r
           WHERE r.TargetSchema = p_target_schema AND r.TableName = cc.TABLE_NAME AND r.ColumnName = cc.COLUMN_NAME
       )
     ON DUPLICATE KEY UPDATE Enabled = TRUE;
+
+    -- 4b2. Stale-registry cleanup. A row registered in an earlier run stays
+    -- Enabled=TRUE forever unless something disables it -- if the underlying
+    -- table/view was since dropped, renamed, or replaced (e.g. a former
+    -- base table turned into a real SQL VIEW), every later step that builds
+    -- dynamic SQL against it fails hard ("Table '...' doesn't exist") deep
+    -- into the run, well after FK drop. Catch it here instead: disable any
+    -- currently-Enabled row whose (TableName, ColumnName) no longer exists
+    -- as a column of a BASE TABLE, and say so -- a WARN, not fatal, since
+    -- "this reference no longer applies" is expected schema drift, not a
+    -- run-stopping problem (a renamed table's new name is picked up fresh
+    -- by 4b above on every run; nothing here can hide it).
+    UPDATE obf_admin.obf_UserReferenceRegistry r
+    SET r.Enabled = FALSE
+    WHERE r.TargetSchema = p_target_schema AND r.Enabled = TRUE
+      AND NOT EXISTS (
+          SELECT 1 FROM information_schema.COLUMNS c
+          JOIN information_schema.TABLES t
+            ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME AND t.TABLE_TYPE = 'BASE TABLE'
+          WHERE c.TABLE_SCHEMA = p_target_schema AND c.TABLE_NAME = r.TableName AND c.COLUMN_NAME = r.ColumnName
+      );
+    SET v_stale_disabled = ROW_COUNT();
+    IF v_stale_disabled > 0 THEN
+        CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_discover_user_references', 'WARN',
+            CONCAT(v_stale_disabled, ' previously-registered reference column(s) no longer exist (table dropped/renamed/converted to a view) and were disabled -- see obf_UserReferenceRegistry.'));
+    END IF;
 
     CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_discover_user_references', 'OK',
         (SELECT CONCAT(COUNT(*), ' user-reference column(s) registered.')
@@ -529,7 +604,7 @@ BEGIN
     -- 4c. Type-compatibility check. dap_User.UserID is assumed string-typed (it
     -- holds a stripped, email-derived identifier, per the script header). A
     -- registered reference column
-    -- that is numeric/temporal almost certainly is NOT a UserID copy —
+    -- that is numeric/temporal almost certainly is NOT a UserID copy -
     -- obfuscating it would corrupt it. Flag (WARN); the DBA should set
     -- Enabled=FALSE for any false positive, or fix the schema/discovery.
     SET @dbobf_userid_type = (
@@ -546,7 +621,7 @@ BEGIN
           AND c.DATA_TYPE NOT IN ('varchar','char','text','tinytext','mediumtext','longtext','enum','set')
     ) THEN
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_discover_user_references', 'WARN',
-            'One or more registered user-reference columns are not string-typed like dap_User.UserID — review the diagnostic result set and set Enabled=FALSE for any that are not UserID copies.');
+            'One or more registered user-reference columns are not string-typed like dap_User.UserID - review the diagnostic result set and set Enabled=FALSE for any that are not UserID copies.');
     END IF;
 
     -- Diagnostic result set for a human to eyeball before destructive steps run.
@@ -762,7 +837,7 @@ BEGIN
 
     IF v_remaining > 0 THEN
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_create_user_mapping', 'ERROR',
-            CONCAT(v_remaining, ' user(s) could not be mapped after retries — investigate collisions.'));
+            CONCAT(v_remaining, ' user(s) could not be mapped after retries - investigate collisions.'));
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'User mapping incomplete after collision retries.';
     ELSE
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_create_user_mapping', 'OK',
@@ -776,17 +851,17 @@ DELIMITER ;
 -- 5b. Orphan user-reference handling
 --     A user-reference value that matches no dap_User.UserID never gets a
 --     mapping row, so obf_sp_obfuscate_user_references would silently leave
---     the ORIGINAL value in place — a PII leak, and one the old post-run
+--     the ORIGINAL value in place - a PII leak, and one the old post-run
 --     check could only flag *after* everything was already committed.
 --     FK-discovered columns cannot have these (the constraint forbids it);
 --     NAMING_CONVENTION / MANUAL columns routinely do (ex-staff, 'SYSTEM'
 --     sentinels, legacy bad data).
 --
---     obf_sp_report_orphan_user_references  — pre-flight, read-only. Emits
+--     obf_sp_report_orphan_user_references  - pre-flight, read-only. Emits
 --         every offending (table, column, value) so a DBA can eyeball it
 --         BEFORE any destructive step and, if needed, set
 --         obf_UserReferenceRegistry.OrphanAction.
---     obf_sp_resolve_orphan_user_references — acts per column's
+--     obf_sp_resolve_orphan_user_references - acts per column's
 --         OrphanAction: OBFUSCATE (default) synthesises a mapping row for
 --         each stray value so it is rewritten like any other reference;
 --         NULLIFY sets them NULL; IGNORE leaves them and tells
@@ -900,7 +975,7 @@ BEGIN
 
         IF v_action = 'IGNORE' THEN
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_resolve_orphan_user_references', 'SKIP',
-                CONCAT(v_table, '.', v_column, ' — OrphanAction=IGNORE; unmatched values left as-is.'));
+                CONCAT(v_table, '.', v_column, ' - OrphanAction=IGNORE; unmatched values left as-is.'));
             ITERATE read_loop;
         END IF;
 
@@ -921,7 +996,7 @@ BEGIN
                 SET v_affected = ROW_COUNT(); DEALLOCATE PREPARE stmt;
             END WHILE;
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_resolve_orphan_user_references', 'OK',
-                CONCAT(v_table, '.', v_column, ' — unmatched values set to NULL.'));
+                CONCAT(v_table, '.', v_column, ' - unmatched values set to NULL.'));
             ITERATE read_loop;
         END IF;
 
@@ -965,13 +1040,13 @@ BEGIN
 
         IF v_remaining > 0 THEN
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_resolve_orphan_user_references', 'ERROR',
-                CONCAT(v_table, '.', v_column, ' — ', v_remaining,
+                CONCAT(v_table, '.', v_column, ' - ', v_remaining,
                        ' orphan value(s) unmapped after collision retries.'));
             SIGNAL SQLSTATE '45000'
                 SET MESSAGE_TEXT = 'Orphan user-reference mapping incomplete after collision retries.';
         ELSE
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_resolve_orphan_user_references', 'OK',
-                CONCAT(v_table, '.', v_column, ' — unmatched values mapped for obfuscation.'));
+                CONCAT(v_table, '.', v_column, ' - unmatched values mapped for obfuscation.'));
         END IF;
     END LOOP;
     CLOSE cur;
@@ -981,7 +1056,7 @@ DELIMITER ;
 -- ---------------------------------------------------------------------
 -- 6. FK management: drop constraints referencing dap_User.UserID,
 --    capturing exact definitions, then restore them later.
---    This is the alternative to SET FOREIGN_KEY_CHECKS=0 — restoring
+--    This is the alternative to SET FOREIGN_KEY_CHECKS=0 - restoring
 --    the constraint re-validates every row and fails loudly if broken.
 -- ---------------------------------------------------------------------
 
@@ -1087,7 +1162,7 @@ BEGIN
         );
 
         -- This ALTER will fail with a real, actionable error if any row
-        -- would violate the constraint — i.e. it doubles as a referential
+        -- would violate the constraint - i.e. it doubles as a referential
         -- integrity validation step.
         SET @sql_stmt = v_sql;
         PREPARE stmt FROM @sql_stmt;
@@ -1195,7 +1270,7 @@ DELIMITER ;
 -- 9. obf_sp_obfuscate_configured_columns
 --    Dynamic dispatch over obf_ObfuscationConfig. Each PII column is joined
 --    back to dap_User via the same user-reference chain so replacement
---    values are keyed off the OWNING USER, not the raw string value —
+--    values are keyed off the OWNING USER, not the raw string value -
 --    satisfying "John Smith / John Brown / John Taylor" independence.
 --
 --    Assumption: every table carrying PII columns also carries a
@@ -1462,7 +1537,7 @@ DELIMITER ;
 --       10a  orphaned user-reference values (excl. OrphanAction=IGNORE)
 --       10b  row-count reconciliation vs the BEFORE snapshot
 --       10c  residual-PII spot checks (heuristic)
---       10d  overall status — SIGNAL 45000 if any of the above failed
+--       10d  overall status - SIGNAL 45000 if any of the above failed
 -- ---------------------------------------------------------------------
 
 DELIMITER $$
@@ -1490,7 +1565,7 @@ BEGIN
     -- 10a. After a clean run every user-reference value must be either NULL or a
     -- known ObfuscatedUserID. Strays were reported pre-flight and handled by
     -- obf_sp_resolve_orphan_user_references, so a hit here means THIS run left
-    -- something inconsistent — a bug, or an interrupted/partial run — not merely
+    -- something inconsistent - a bug, or an interrupted/partial run - not merely
     -- pre-existing bad data. Columns a DBA set to OrphanAction='IGNORE' are a
     -- deliberate exception and are skipped.
     OPEN cur;
@@ -1502,7 +1577,7 @@ BEGIN
 
         IF v_action = 'IGNORE' THEN
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'SKIP',
-                CONCAT(v_table, '.', v_column, ' — OrphanAction=IGNORE, not checked for unmatched values.'));
+                CONCAT(v_table, '.', v_column, ' - OrphanAction=IGNORE, not checked for unmatched values.'));
             ITERATE read_loop;
         END IF;
 
@@ -1560,7 +1635,7 @@ BEGIN
         END IF;
     ELSE
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'SKIP',
-            'Row-count reconciliation skipped — no BEFORE snapshot for this RunID (standalone call?).');
+            'Row-count reconciliation skipped - no BEFORE snapshot for this RunID (standalone call?).');
     END IF;
 
     -- 10c. Residual-PII spot checks. Heuristic, not exhaustive: catches values
@@ -1632,7 +1707,7 @@ BEGIN
                 SET v_residual = v_residual + @cnt;
                 CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'ERROR',
                     CONCAT(@cnt, ' value(s) in ', v_table, '.', v_column, ' (', v_type,
-                           ') are not in the obfuscated form — possible residual PII.'));
+                           ') are not in the obfuscated form - possible residual PII.'));
             END IF;
         END IF;
     END LOOP;
@@ -1646,12 +1721,12 @@ BEGIN
     -- 10d. Overall status
     IF v_unmapped_refs > 0 OR v_rc_mismatch > 0 OR v_residual > 0 THEN
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'ERROR',
-            CONCAT('Post-run validation FAILED — orphaned refs: ', v_unmapped_refs,
+            CONCAT('Post-run validation FAILED - orphaned refs: ', v_unmapped_refs,
                    ', row-count mismatches: ', v_rc_mismatch,
                    ', residual-PII hits: ', v_residual, '. ',
-                   'The refresh did not complete cleanly — fix the cause and re-run obf_sp_obfuscate_database (it resumes).'));
+                   'The refresh did not complete cleanly - fix the cause and re-run obf_sp_obfuscate_database (it resumes).'));
         SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Post-run validation failed — see obf_ObfuscationRunLog for the offending table.column(s).';
+            SET MESSAGE_TEXT = 'Post-run validation failed - see obf_ObfuscationRunLog for the offending table.column(s).';
     ELSE
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'OK', 'Validation passed.');
     END IF;
@@ -1663,7 +1738,7 @@ DELIMITER ;
 --     Optional cleanup: strips real PII (OriginalUserID) out of the
 --     mapping table once obfuscation is validated. Only call this once
 --     you're sure no further delta-sync re-run against production is
---     planned for this refresh cycle — see design doc §C.
+--     planned for this refresh cycle - see design doc §C.
 -- ---------------------------------------------------------------------
 
 DELIMITER $$
@@ -1782,7 +1857,7 @@ DELIMITER ;
 -- 12. obf_sp_obfuscate_database
 --     Master orchestrator. Single entry point.
 --     p_target_schema : the application schema to obfuscate (this admin
---                     schema's own state is fully isolated per target —
+--                     schema's own state is fully isolated per target -
 --                     see the architecture note at the top of this file)
 --     p_salt        : a secret, run-specific salt (rotate per environment refresh;
 --                     a RESUME run must reuse the interrupted run's salt)
@@ -1832,21 +1907,45 @@ BEGIN
         RESIGNAL;
     END;
 
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'Started OBF', CURRENT_TIMESTAMP);
+
     -- Pre-flight run-state, scoped to THIS target schema only -- another
     -- target's genuinely-running job must never be touched. Retire any
     -- prior run for this target that never recorded an outcome (hard
     -- crash / killed connection), then note if we are resuming.
     UPDATE obf_admin.obf_ObfuscationRun SET Status = 'SUPERSEDED', FinishedAt = NOW()
      WHERE TargetSchema = p_target_schema AND Status = 'RUNNING';
+     
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_ObfuscationRun - set status RUNNING', CURRENT_TIMESTAMP);
+
     -- Discard spent FK backups for this target (constraint already back on
     -- the table -- the row is redundant with information_schema).
     -- Un-restored rows are the resume signal and are kept.
     DELETE FROM obf_admin.obf_FkConstraintBackup WHERE TargetSchema = p_target_schema AND RestoredDate IS NOT NULL;
+    
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_FkConstraintBackup deleted', CURRENT_TIMESTAMP);
+
     SET v_dangling_fk = (SELECT COUNT(*) FROM obf_admin.obf_FkConstraintBackup WHERE TargetSchema = p_target_schema AND RestoredDate IS NULL);
     SET v_prev_status = (SELECT Status FROM obf_admin.obf_ObfuscationRun WHERE TargetSchema = p_target_schema ORDER BY StartedAt DESC LIMIT 1);
 
-    INSERT INTO obf_admin.obf_ObfuscationRun (RunID, TargetSchema, Status, Salt) VALUES (v_run_id, p_target_schema, 'RUNNING', p_salt);
+    INSERT INTO obf_admin.obf_ObfuscationRun (RunID, TargetSchema, Status, Salt) 
+    VALUES (v_run_id, p_target_schema, 'RUNNING', p_salt);
+    
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_ObfuscationRun - running', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_log_step(p_target_schema, v_run_id, 'obf_sp_obfuscate_database', 'START', CONCAT('Run started, RunID=', v_run_id));
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_log_step', CURRENT_TIMESTAMP);
 
     IF v_dangling_fk > 0 OR v_prev_status IN ('FAILED', 'SUPERSEDED') THEN
         CALL obf_admin.obf_sp_log_step(p_target_schema, v_run_id, 'obf_sp_obfuscate_database', 'WARN',
@@ -1856,38 +1955,110 @@ BEGIN
     END IF;
 
     CALL obf_admin.obf_sp_validate_config(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_validate_config', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_discover_user_references(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_discover_user_references', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_validate_reference_column_lengths(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_validate_reference_column_lengths', CURRENT_TIMESTAMP);
 
     -- BEFORE row-count snapshot (registry + config tables are known now).
     -- obf_sp_validate_obfuscation compares AFTER counts against this.
     CALL obf_admin.obf_sp_snapshot_row_counts(p_target_schema, v_run_id, 'BEFORE');
 
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_snapshot_row_counts', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_create_user_mapping(p_target_schema, v_run_id, p_salt);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_create_user_mapping', CURRENT_TIMESTAMP);
 
     -- Pre-flight: surface (don't yet touch) any user-reference value that has
     -- no dap_User match, so it can be eyeballed before destructive steps.
     CALL obf_admin.obf_sp_report_orphan_user_references(p_target_schema, v_run_id);
+  
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_report_orphan_user_references', CURRENT_TIMESTAMP);
+
     -- Act on those values per each column's obf_UserReferenceRegistry.OrphanAction
     -- (OBFUSCATE | NULLIFY | IGNORE). Runs before FK drop so mapped values are
     -- then rewritten by obf_sp_obfuscate_user_references like any other reference.
     CALL obf_admin.obf_sp_resolve_orphan_user_references(p_target_schema, v_run_id, p_salt);
 
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_resolve_orphan_user_references', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_drop_user_fk_constraints(p_target_schema, v_run_id);
+   
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_drop_user_fk_constraints', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_obfuscate_user_references(p_target_schema, v_run_id, p_batch_size);
+    
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_obfuscate_user_references', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_obfuscate_user_table(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_obfuscate_user_table', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_restore_user_fk_constraints(p_target_schema, v_run_id); -- re-validates FKs as a side effect
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_restore_user_fk_constraints', CURRENT_TIMESTAMP);
 
     CALL obf_admin.obf_sp_obfuscate_configured_columns(p_target_schema, v_run_id, p_batch_size, p_salt);
 
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_obfuscate_configured_columns', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_validate_obfuscation(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_validate_obfuscation', CURRENT_TIMESTAMP);
 
     IF p_purge_after THEN
         CALL obf_admin.obf_sp_purge_sensitive_staging(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_purge_sensitive_staging', CURRENT_TIMESTAMP);
+
     END IF;
 
     UPDATE obf_admin.obf_ObfuscationRun SET Status = 'COMPLETED', FinishedAt = NOW() WHERE RunID = v_run_id;
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_ObfuscationRun - COMPLETED', CURRENT_TIMESTAMP);
+
     CALL obf_admin.obf_sp_log_step(p_target_schema, v_run_id, 'obf_sp_obfuscate_database', 'OK', 'Run completed successfully.');
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_log_step', CURRENT_TIMESTAMP);
 
     SELECT v_run_id AS RunID;
 END$$
@@ -1911,3 +2082,5 @@ DELIMITER ;
 -- =====================================================================
 -- CALL obf_admin.obf_sp_obfuscate_database('appiandev2', 'CHANGE-THIS-SECRET-SALT-PER-ENVIRONMENT', 50000, FALSE);
 -- SELECT * FROM obf_admin.obf_ObfuscationRunLog WHERE TargetSchema = 'appiandev2' ORDER BY LogID;
+-- CALL obf_admin.obf_sp_obfuscate_database('AppianTrn', 'AppianTrnSalt', 50000, FALSE);
+-- SELECT * FROM obf_admin.obf_ObfuscationRunLog WHERE TargetSchema = 'AppianTrn' ORDER BY LogID;

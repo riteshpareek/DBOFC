@@ -314,10 +314,15 @@ reconciliation. Add your own eyeball checks against the **target** schema, e.g.:
 
 ```sql
 -- every UserID is now a known obfuscated one (not a string-pattern check --
--- the obfuscated form has no fixed marker like a real email's '@domain')
+-- the obfuscated form has no fixed marker like a real email's '@domain').
+-- The CONVERT(...)/COLLATE matches what the framework's own internal joins
+-- use (see "Cross-schema collation safety" in 01-Design-and-Architecture.md
+-- §C) -- without it, this query itself can throw "Illegal mix of
+-- collations" if dap_User.UserID isn't on the same collation as
+-- obf_UserObfuscationMapping (routine for a legacy target schema).
 SELECT COUNT(*) FROM appiandev2.dap_User u
 LEFT JOIN obf_admin.obf_UserObfuscationMapping m
-  ON m.TargetSchema = 'appiandev2' AND m.ObfuscatedUserID = u.UserID
+  ON m.TargetSchema = 'appiandev2' AND m.ObfuscatedUserID = CONVERT(u.UserID USING utf8mb4) COLLATE utf8mb4_general_ci
 WHERE u.UserID IS NOT NULL AND m.ObfuscatedUserID IS NULL;                -- expect 0
 
 -- no obviously-real names survived
@@ -331,7 +336,7 @@ obfuscated user:
 SELECT 'dap_Actor.CreatedBy' col, COUNT(*) bad
 FROM appiandev2.dap_Actor a
 LEFT JOIN obf_admin.obf_UserObfuscationMapping m
-  ON m.TargetSchema = 'appiandev2' AND m.ObfuscatedUserID = a.CreatedBy
+  ON m.TargetSchema = 'appiandev2' AND m.ObfuscatedUserID = CONVERT(a.CreatedBy USING utf8mb4) COLLATE utf8mb4_general_ci
 WHERE a.CreatedBy IS NOT NULL AND m.ObfuscatedUserID IS NULL;                -- expect 0
 ```
 

@@ -121,7 +121,7 @@ reset
 q "UPDATE dap_Actor SET CreatedBy='ghost-user@test.com' WHERE ActorID=1;" >/dev/null
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 chk "10a OBFUSCATE: run succeeds, ghost value gone" "$(q "SELECT COUNT(*) FROM dap_Actor WHERE CreatedBy='ghost-user@test.com';")" "0"
-chk "10a: CreatedBy now all known obfuscated ids" "$(qa "SELECT COUNT(*)=SUM(m.ObfuscatedUserID IS NOT NULL) FROM ${DBOBF_DB}.dap_Actor a LEFT JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.ObfuscatedUserID=a.CreatedBy WHERE a.CreatedBy IS NOT NULL;")" "1"
+chk "10a: CreatedBy now all known obfuscated ids" "$(qa "SELECT COUNT(*)=SUM(m.ObfuscatedUserID IS NOT NULL) FROM ${DBOBF_DB}.dap_Actor a LEFT JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.ObfuscatedUserID=CONVERT(a.CreatedBy USING utf8mb4) COLLATE utf8mb4_general_ci WHERE a.CreatedBy IS NOT NULL;")" "1"
 reset
 q "UPDATE dap_Actor SET CreatedBy='ghost-user@test.com' WHERE ActorID=1;" >/dev/null
 qa "CALL obf_admin.obf_sp_discover_user_references('$DBOBF_DB', UUID());
@@ -169,7 +169,7 @@ reset
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 RID=$(qa "SELECT RunID FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB' ORDER BY StartedAt DESC LIMIT 1;")
 q "UPDATE dap_User SET FirstName='Zoltan'
-   WHERE UserID IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB') LIMIT 1;" >/dev/null
+   WHERE CONVERT(UserID USING utf8mb4) COLLATE utf8mb4_general_ci IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB') LIMIT 1;" >/dev/null
 RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_validate_obfuscation('$DBOBF_DB', '$RID');" >/dev/null 2>&1; echo $?)
 chk "12c residual name -> raises" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)" "1"
 
@@ -202,7 +202,7 @@ qa "DELETE FROM obf_SyntheticFirstName; INSERT INTO obf_SyntheticFirstName (Seed
    DELETE FROM obf_SyntheticLastName;  INSERT INTO obf_SyntheticLastName  (SeedID,NameValue) VALUES (3,'Kade'),(77,'Loom'),(1201,'Mira');
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 chk "14a F7: no NULL names with gappy SeedID" "$(q "SELECT COUNT(*) FROM dap_User WHERE FirstName IS NULL OR LastName IS NULL;")" "0"
-chk "14a F7: all names from the pool" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_User d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=d.FirstName) AND EXISTS(SELECT 1 FROM obf_SyntheticLastName s WHERE s.NameValue=d.LastName);")" "3"
+chk "14a F7: all names from the pool" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_User d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=CONVERT(d.FirstName USING utf8mb4) COLLATE utf8mb4_general_ci) AND EXISTS(SELECT 1 FROM obf_SyntheticLastName s WHERE s.NameValue=CONVERT(d.LastName USING utf8mb4) COLLATE utf8mb4_general_ci);")" "3"
 reset
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','a',10000,FALSE);
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','b',10000,FALSE);
@@ -226,7 +226,7 @@ q "UPDATE dap_Actor SET CreatedBy='JOHN@TEST.COM' WHERE ActorID=1;" >/dev/null  
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 chk "15a mapping stores OriginalUserID lower-cased" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB' AND OriginalUserID <> LOWER(OriginalUserID);")" "0"
 chk "15a no spurious extra mapping row for the case variant" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB';")" "3"
-chk "15a case-variant CreatedBy resolved to john's obfuscated id" "$(qa "SELECT (a.CreatedBy = m.ObfuscatedUserID) FROM ${DBOBF_DB}.dap_Actor a JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.OriginalUserID='john@test.com' WHERE a.ActorID=1;")" "1"
+chk "15a case-variant CreatedBy resolved to john's obfuscated id" "$(qa "SELECT (CONVERT(a.CreatedBy USING utf8mb4) COLLATE utf8mb4_general_ci = m.ObfuscatedUserID) FROM ${DBOBF_DB}.dap_Actor a JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.OriginalUserID='john@test.com' WHERE a.ActorID=1;")" "1"
 # 15b: under a case-sensitive collation, case-only duplicates in dap_User are a hard stop
 reset
 q "ALTER TABLE dap_Actor DROP FOREIGN KEY FK_Actor_User;
@@ -262,7 +262,7 @@ chk "18a: SKIP logged" "$(qa "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE
 qa "INSERT INTO obf_TableSeedOverride (TargetSchema,TableName,ColumnName) VALUES ('$DBOBF_DB','dap_NoPkContact','id');
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 chk "18b override registered -> now obfuscated" "$(q "SELECT COUNT(*) FROM dap_NoPkContact WHERE FirstName IN ('John','Jane');")" "0"
-chk "18b: values drawn from the synthetic pool" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_NoPkContact d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=d.FirstName);")" "2"
+chk "18b: values drawn from the synthetic pool" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_NoPkContact d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=CONVERT(d.FirstName USING utf8mb4) COLLATE utf8mb4_general_ci);")" "2"
 
 echo "### TEST 19  multi-target isolation (two targets, one admin install)"
 DBOBF_DB2="${DBOBF_DB}_2"
@@ -272,8 +272,8 @@ qa "INSERT INTO obf_ObfuscationConfig (TargetSchema, TableName, ColumnName, Obfu
      ('$DBOBF_DB2','dap_User','FirstName','FIRST_NAME'),('$DBOBF_DB2','dap_User','LastName','LAST_NAME');
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB', 'salt-target-1', 10000, FALSE);
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB2','salt-target-2', 10000, FALSE);" >/dev/null
-chk "19a target 1 obfuscated" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.ObfuscatedUserID=u.UserID;")" "3"
-chk "19b target 2 obfuscated independently" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB2}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB2' AND m.ObfuscatedUserID=u.UserID;")" "3"
+chk "19a target 1 obfuscated" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.ObfuscatedUserID=CONVERT(u.UserID USING utf8mb4) COLLATE utf8mb4_general_ci;")" "3"
+chk "19b target 2 obfuscated independently" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB2}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB2' AND m.ObfuscatedUserID=CONVERT(u.UserID USING utf8mb4) COLLATE utf8mb4_general_ci;")" "3"
 chk "19c mapping rows fully isolated per target" "$(qa "SELECT COUNT(DISTINCT TargetSchema) FROM obf_UserObfuscationMapping WHERE TargetSchema IN ('$DBOBF_DB','$DBOBF_DB2');")" "2"
 chk "19d target 1's ObfuscatedUserID differs from target 2's for the same email" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping m1 JOIN obf_UserObfuscationMapping m2 ON m1.OriginalUserID=m2.OriginalUserID WHERE m1.TargetSchema='$DBOBF_DB' AND m2.TargetSchema='$DBOBF_DB2' AND m1.ObfuscatedUserID=m2.ObfuscatedUserID;")" "0"
 chk "19e target 2 run status independent COMPLETED" "$(qa "SELECT Status FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB2' ORDER BY StartedAt DESC LIMIT 1;")" "COMPLETED"
