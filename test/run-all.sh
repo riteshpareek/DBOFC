@@ -331,6 +331,16 @@ qa "DELETE FROM obf_ObfuscationConfig WHERE TargetSchema='$DBOBF_DB4';
    DELETE FROM obf_ObfuscationRowCountSnapshot WHERE TargetSchema='$DBOBF_DB4';
    DELETE FROM obf_UserReferenceRegistry WHERE TargetSchema='$DBOBF_DB4';" >/dev/null 2>&1
 
+echo "### TEST 22  a table whose only seed candidate is a NULLABLE reference column doesn't silently skip rows where it's NULL"
+reset
+q "CREATE TABLE dap_NullSeedContact (id INT PRIMARY KEY AUTO_INCREMENT, CreatedUserID VARCHAR(255) NULL, FirstName VARCHAR(50));
+   INSERT INTO dap_NullSeedContact (CreatedUserID, FirstName) VALUES ('john@test.com','John'), (NULL,'Jane');" >/dev/null
+qa "INSERT INTO obf_ObfuscationConfig (TargetSchema,TableName,ColumnName,ObfuscationType) VALUES ('$DBOBF_DB','dap_NullSeedContact','FirstName','FIRST_NAME');
+   CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
+chk "22a NULL-seed row (Jane) no longer holds the real name" "$(q "SELECT COUNT(*) FROM dap_NullSeedContact WHERE FirstName='Jane';")" "0"
+chk "22b real-seed row (John) also obfuscated" "$(q "SELECT COUNT(*) FROM dap_NullSeedContact WHERE FirstName='John';")" "0"
+chk "22c both rows drew a synthetic name (none left NULL/untouched)" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_NullSeedContact d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=CONVERT(d.FirstName USING utf8mb4) COLLATE utf8mb4_general_ci);")" "2"
+
 echo
 echo "======================================"
 echo "  PASS: $pass   FAIL: $fail"

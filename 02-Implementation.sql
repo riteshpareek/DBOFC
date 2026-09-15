@@ -1292,6 +1292,7 @@ BEGIN
     DECLARE v_type VARCHAR(50);
     DECLARE v_static VARCHAR(255);
     DECLARE v_pk_col VARCHAR(128);
+    DECLARE v_true_pk_col VARCHAR(128);
     DECLARE v_col_len INT;
     DECLARE v_sql TEXT;
     DECLARE v_rows_affected BIGINT;
@@ -1341,16 +1342,28 @@ BEGIN
             LIMIT 1
         );
 
+        -- Always resolve the table's true PRIMARY KEY too (not just as a
+        -- fallback when no reference column exists) -- a registered
+        -- reference column is very often a nullable audit column
+        -- (CreatedUserID/ModifiedUserID/ActivityDateUpdateUserID/...), and a
+        -- NULL seed makes every generator function return NULL, which the
+        -- idempotency guard's "<> generator(seed)" comparison can never
+        -- satisfy (NULL <> NULL is NULL, not TRUE) -- so those rows would
+        -- silently never be touched at all, forever, real PII intact. The
+        -- true PK is used below as a per-row COALESCE fallback precisely for
+        -- that case; it's never itself NULL.
+        SET v_true_pk_col = (
+            SELECT kcu.COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE kcu
+            JOIN information_schema.TABLE_CONSTRAINTS tc
+                ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+            WHERE kcu.TABLE_SCHEMA = p_target_schema AND kcu.TABLE_NAME = v_table
+              AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+            LIMIT 1
+        );
+
         IF v_pk_col IS NULL THEN
-            SET v_pk_col = (
-                SELECT kcu.COLUMN_NAME
-                FROM information_schema.KEY_COLUMN_USAGE kcu
-                JOIN information_schema.TABLE_CONSTRAINTS tc
-                    ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
-                WHERE kcu.TABLE_SCHEMA = p_target_schema AND kcu.TABLE_NAME = v_table
-                  AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
-                LIMIT 1
-            );
+            SET v_pk_col = v_true_pk_col;
         END IF;
 
         -- Last resort: a DBA-registered manual seed column.
@@ -1371,7 +1384,14 @@ BEGIN
             );
 
             SET v_qualified_table = obf_admin.obf_fn_quote_qualified(p_target_schema, v_table);
-            SET v_seed_expr = CONCAT('t.', obf_admin.obf_fn_quote_identifier(v_pk_col));
+            IF v_true_pk_col IS NOT NULL AND v_true_pk_col <> v_pk_col THEN
+                -- Chosen seed is a (possibly nullable) reference column, and a
+                -- true PK exists to fall back on for whichever rows it's NULL.
+                SET v_seed_expr = CONCAT('COALESCE(t.', obf_admin.obf_fn_quote_identifier(v_pk_col),
+                                          ', t.', obf_admin.obf_fn_quote_identifier(v_true_pk_col), ')');
+            ELSE
+                SET v_seed_expr = CONCAT('t.', obf_admin.obf_fn_quote_identifier(v_pk_col));
+            END IF;
 
             SET v_rows_affected = 1;
             WHILE v_rows_affected > 0 DO
