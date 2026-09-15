@@ -718,9 +718,9 @@ BEGIN
     SET v_mapping_where = CONCAT(
         'FROM ', v_target_tbl, ' u ',
         'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) COLLATE utf8mb4_general_ci ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = CONVERT(LOWER(u.UserID) USING utf8mb4) COLLATE utf8mb4_general_ci ',
         'WHERE m.OriginalUserID IS NULL AND u.UserID IS NOT NULL ',
-        '  AND u.UserID COLLATE utf8mb4_general_ci NOT IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')'
+        '  AND CONVERT(u.UserID USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')'
     );
 
     SET v_sql = CONCAT(
@@ -833,9 +833,9 @@ BEGIN
                    't.', obf_admin.obf_fn_quote_identifier(v_column), ', COUNT(*) ',
             'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping mo ',
-              'ON mo.TargetSchema = ', QUOTE(p_target_schema), ' AND mo.OriginalUserID   = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
+              'ON mo.TargetSchema = ', QUOTE(p_target_schema), ' AND mo.OriginalUserID   = CONVERT(LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') USING utf8mb4) COLLATE utf8mb4_general_ci ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping mx ',
-              'ON mx.TargetSchema = ', QUOTE(p_target_schema), ' AND mx.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci ',
+              'ON mx.TargetSchema = ', QUOTE(p_target_schema), ' AND mx.ObfuscatedUserID = CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci ',
             'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
             '  AND mo.OriginalUserID IS NULL ',
             '  AND mx.ObfuscatedUserID IS NULL ',
@@ -911,9 +911,9 @@ BEGIN
                     'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                     'SET t.', obf_admin.obf_fn_quote_identifier(v_column), ' = NULL ',
                     'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
-                    '  AND LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci NOT IN ',
+                    '  AND CONVERT(LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN ',
                          '(SELECT OriginalUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ') ',
-                    '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
+                    '  AND CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN ',
                          '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ') ',
                     'LIMIT 50000');
                 SET @sql_stmt = v_sql;
@@ -938,10 +938,10 @@ BEGIN
                             QUOTE(p_salt), ', ', v_attempt, ', ', v_local_len, '), NOW() ',
                 'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                 'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
+                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = CONVERT(LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') USING utf8mb4) COLLATE utf8mb4_general_ci ',
                 'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
                 '  AND m.OriginalUserID IS NULL ',
-                '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
+                '  AND CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN ',
                      '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')');
             SET @sql_stmt = v_sql;
             PREPARE stmt FROM @sql_stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
@@ -951,10 +951,10 @@ BEGIN
                   'SELECT DISTINCT t.', obf_admin.obf_fn_quote_identifier(v_column), ' AS v ',
                   'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                   'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-                    'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
+                    'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = CONVERT(LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') USING utf8mb4) COLLATE utf8mb4_general_ci ',
                   'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
                   '  AND m.OriginalUserID IS NULL ',
-                  '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
+                  '  AND CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci NOT IN ',
                        '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')',
                 ') d');
             SET @sql_stmt = v_sql;
@@ -1141,9 +1141,9 @@ BEGIN
             SET v_sql = CONCAT(
                 'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                 'JOIN obf_admin.obf_UserObfuscationMapping m ',
-                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
+                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = CONVERT(LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') USING utf8mb4) COLLATE utf8mb4_general_ci ',
                 'SET t.', obf_admin.obf_fn_quote_identifier(v_column), ' = m.ObfuscatedUserID ',
-                'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID ',
+                'WHERE CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID ',
                 'LIMIT ', p_batch_size
             );
             SET @sql_stmt = v_sql;
@@ -1176,9 +1176,9 @@ BEGIN
     SET v_sql = CONCAT(
         'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User'), ' u ',
         'JOIN obf_admin.obf_UserObfuscationMapping m ',
-          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) COLLATE utf8mb4_general_ci ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = CONVERT(LOWER(u.UserID) USING utf8mb4) COLLATE utf8mb4_general_ci ',
         'SET u.UserID = m.ObfuscatedUserID ',
-        'WHERE u.UserID COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID'
+        'WHERE CONVERT(u.UserID USING utf8mb4) COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID'
     );
     SET @sql_stmt = v_sql;
     PREPARE stmt FROM @sql_stmt;
@@ -1509,7 +1509,7 @@ BEGIN
         SET v_sql = CONCAT(
             'SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-              'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci ',
+              'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci ',
             'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND m.ObfuscatedUserID IS NULL'
         );
         SET @sql_stmt = v_sql;
@@ -1579,7 +1579,7 @@ BEGIN
     SET v_sql = CONCAT(
         'SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User'), ' t ',
         'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = t.UserID COLLATE utf8mb4_general_ci ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = CONVERT(t.UserID USING utf8mb4) COLLATE utf8mb4_general_ci ',
         'WHERE t.UserID IS NOT NULL AND m.ObfuscatedUserID IS NULL'
     );
     SET @sql_stmt = v_sql;
@@ -1605,17 +1605,17 @@ BEGIN
             WHEN 'FIRST_NAME' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticFirstName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci)');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticFirstName s WHERE s.NameValue = CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci)');
             WHEN 'LAST_NAME' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticLastName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci)');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticLastName s WHERE s.NameValue = CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci)');
             WHEN 'ADDRESS' THEN
                 -- ADDRESS is LEFT(synthetic, col_len), so match on equality OR prefix.
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticStreetAddress s WHERE s.AddressValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci',
-                    ' OR s.AddressValue LIKE CONCAT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci, ''%''))');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticStreetAddress s WHERE s.AddressValue = CONVERT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' USING utf8mb4) COLLATE utf8mb4_general_ci',
+                    ' OR s.AddressValue LIKE CONVERT(CONCAT(t.', obf_admin.obf_fn_quote_identifier(v_column), ', ''%'') USING utf8mb4) COLLATE utf8mb4_general_ci)');
             WHEN 'PHONE' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table),
                     ' WHERE ', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND ',

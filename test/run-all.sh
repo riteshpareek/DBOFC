@@ -308,6 +308,29 @@ qa "DELETE FROM obf_ObfuscationConfig WHERE TargetSchema='$DBOBF_DB3';
    DELETE FROM obf_ObfuscationRowCountSnapshot WHERE TargetSchema='$DBOBF_DB3';
    DELETE FROM obf_UserReferenceRegistry WHERE TargetSchema='$DBOBF_DB3';" >/dev/null 2>&1
 
+echo "### TEST 21  target schema on a different CHARACTER SET than obf_admin (e.g. legacy utf8mb3 vs obf_admin's utf8mb4) doesn't hit 'COLLATION ... is not valid for CHARACTER SET ...'"
+DBOBF_DB4="${DBOBF_DB}_mb3"
+$MYSQL -e "DROP DATABASE IF EXISTS \`$DBOBF_DB4\`; CREATE DATABASE \`$DBOBF_DB4\` CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;" >/dev/null 2>&1
+$MYSQL $DBOBF_DB4 < "$ROOT/test/reset.sql" >/dev/null 2>&1
+qa "INSERT INTO obf_ObfuscationConfig (TargetSchema, TableName, ColumnName, ObfuscationType) VALUES
+     ('$DBOBF_DB4','dap_User','FirstName','FIRST_NAME'),('$DBOBF_DB4','dap_User','LastName','LAST_NAME'),
+     ('$DBOBF_DB4','dap_User','PhoneNumber','PHONE'),('$DBOBF_DB4','dap_User','Address','ADDRESS'),
+     ('$DBOBF_DB4','dap_Actor','FirstName','FIRST_NAME'),('$DBOBF_DB4','dap_Actor','LastName','LAST_NAME');" >/dev/null
+RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB4','test-salt-mb3',10000,FALSE);" >/dev/null 2>&1; echo $?)
+chk "21a run against a utf8mb3 target succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)" "1"
+S1=$($MYSQL $DBOBF_DB4 -N -e "SELECT SHA2(GROUP_CONCAT(UserID,FirstName,LastName,PhoneNumber,Address ORDER BY UserID),256) FROM dap_User;")
+RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB4','test-salt-mb3',10000,FALSE);" >/dev/null 2>&1; echo $?)
+S2=$($MYSQL $DBOBF_DB4 -N -e "SELECT SHA2(GROUP_CONCAT(UserID,FirstName,LastName,PhoneNumber,Address ORDER BY UserID),256) FROM dap_User;")
+chk "21b second run against it is still idempotent" "$([ "$RC" -eq 0 ] && [ "$S1" = "$S2" ] && echo 1 || echo 0)" "1"
+chk "21c mapping row count stable at 3 (no spurious re-mapping)" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB4';")" "3"
+$MYSQL -e "DROP DATABASE IF EXISTS \`$DBOBF_DB4\`;" >/dev/null 2>&1
+qa "DELETE FROM obf_ObfuscationConfig WHERE TargetSchema='$DBOBF_DB4';
+   DELETE FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB4';
+   DELETE FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB4';
+   DELETE FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB4';
+   DELETE FROM obf_ObfuscationRowCountSnapshot WHERE TargetSchema='$DBOBF_DB4';
+   DELETE FROM obf_UserReferenceRegistry WHERE TargetSchema='$DBOBF_DB4';" >/dev/null 2>&1
+
 echo
 echo "======================================"
 echo "  PASS: $pass   FAIL: $fail"

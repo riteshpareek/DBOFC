@@ -440,6 +440,24 @@ FROM dap_User;
 --   (no spurious re-mapping of already-obfuscated values as new "originals").
 
 -- ---------------------------------------------------------------------
+-- TEST 21: Target schema on a different CHARACTER SET than obf_admin (not
+--   just a different collation of the same charset) -- e.g. a legacy
+--   schema still on utf8mb3 ("utf8") against obf_admin's utf8mb4 -- must
+--   not raise "COLLATION 'utf8mb4_general_ci' is not valid for CHARACTER
+--   SET 'utf8mb3'". Forcing a bare COLLATE utf8mb4_general_ci (TEST 20's
+--   fix) is not enough here -- the target-schema side of every such
+--   comparison is first CONVERT(... USING utf8mb4)'d, which is always a
+--   safe, lossless promotion from utf8mb3 (see "Cross-schema collation
+--   safety" in 01-Design-and-Architecture.md §C).
+-- ---------------------------------------------------------------------
+-- CREATE DATABASE AppianMb3 CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;
+-- (build the TEST 0 fixture in AppianMb3; configure it in obf_ObfuscationConfig with TargetSchema='AppianMb3')
+-- CALL obf_admin.obf_sp_obfuscate_database('AppianMb3', 'test-salt-mb3', 10000, FALSE);
+-- EXPECT: run succeeds (no SQLSTATE 42000 "COLLATION ... is not valid for CHARACTER SET ...").
+-- CALL obf_admin.obf_sp_obfuscate_database('AppianMb3', 'test-salt-mb3', 10000, FALSE);   -- run again
+-- EXPECT: still succeeds; dap_User state unchanged (idempotent); mapping row count still 3.
+
+-- ---------------------------------------------------------------------
 -- Review the full run history for a target at any point (run against obf_admin):
 -- ---------------------------------------------------------------------
 SELECT * FROM obf_ObfuscationRunLog WHERE TargetSchema = @target ORDER BY LogID;

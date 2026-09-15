@@ -9,13 +9,13 @@ every concrete case in `03-Test-Plan.sql`.
 > — see "Admin-schema migration review" at the bottom for that pass's findings (M1–M3, all
 > fixed). A fourth pass corrected a wrong assumption about `dap_User.UserID` — see
 > "UserID-is-not-an-email correction" — and testing that surfaced an unrelated cross-schema
-> collation bug, fixed in the same pass — see "Cross-schema collation bug" — both at the
-> very bottom.
+> collation bug, fixed in two stages (a collation mismatch, then a stricter character-set
+> mismatch) — see "Cross-schema collation bug" and its follow-up — both at the very bottom.
 >
 > The whole plan runs as assertions via `bash test/run-all.sh` (drops the admin schema and
-> a target database, reloads `02-Implementation.sql`, exercises Tests 1–20, including a
-> dedicated multi-target isolation test and a collation-mismatch regression test) —
-> currently **66/66 pass**. (Historical note: this banner read 49/49 against the
+> a target database, reloads `02-Implementation.sql`, exercises Tests 1–21, including a
+> dedicated multi-target isolation test and two collation/charset-mismatch regression
+> tests) — currently **69/69 pass**. (Historical note: this banner read 49/49 against the
 > pre-migration, single-schema version of the framework, then 63/63 after the admin-schema
 > migration — see individual findings below for their original verification counts, which
 > remain accurate for what they tested at the time.)
@@ -602,3 +602,31 @@ manually stepped through every affected sub-procedure individually against the s
 reproduction to isolate the fix before adding the automated test. Full suite —
 **66/66 pass** (63 prior + this new test's 3 assertions), against both a
 collation-matched and a deliberately collation-mismatched target.
+
+### Follow-up: the fix above wasn't enough for a different *character set*, not just collation
+
+The operator's actual environment turned out to be `utf8mb3` (MariaDB's name for classic
+3-byte `utf8`), not `utf8mb4_general_ci` — a stricter case than the reproduction above.
+Applying `COLLATE utf8mb4_general_ci` to a genuinely `utf8mb3` column doesn't resolve an
+"illegal mix", it raises a *different* error:
+
+```
+ERROR 1253 (42000): COLLATION 'utf8mb4_general_ci' is not valid for CHARACTER SET 'utf8mb3'
+```
+
+— because that collation doesn't exist for that charset at all; `COLLATE` alone can't
+bridge a charset difference, only a collation difference within the same charset.
+
+**Fix applied.** Every one of the same 18 comparison sites now `CONVERT(... USING
+utf8mb4)`s the target-schema expression *before* applying `COLLATE utf8mb4_general_ci` to
+the result, instead of applying `COLLATE` directly to the raw column/expression. `CONVERT`
+promotes the value into `utf8mb4` first (always safe and lossless from `utf8mb3`, a strict
+subset), so the subsequent `COLLATE` is now always being applied to a genuinely `utf8mb4`
+value regardless of what the source column's original charset was.
+
+**Verified:** reproduced against a target schema created with `CHARACTER SET utf8mb3
+COLLATE utf8mb3_general_ci` — confirmed the exact reported error against the prior fix,
+then confirmed it's gone after this one, including a same-salt idempotent second run.
+Added TEST 21 (mirrors TEST 20, but `utf8mb3`) to `test/run-all.sh` / `03-Test-Plan.sql`.
+Full suite — **69/69 pass** (66 prior + this new test's 3 assertions), against a
+collation-matched target, a collation-mismatched `utf8mb4` target, and a `utf8mb3` target.

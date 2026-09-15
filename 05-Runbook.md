@@ -402,8 +402,19 @@ cross-schema comparison in the framework already forces an explicit
 "Cross-schema collation safety" in `01-Design-and-Architecture.md` §C) — if you hit this
 error anyway, you're most likely running an **older copy of `02-Implementation.sql`** that
 predates that fix; reload it (step 2) and retry. It should never recur once you're on the
-current version, for any target-schema collation, as long as the target is `utf8mb4`
-charset (a target on a genuinely different character set is out of scope).
+current version, for any target-schema collation.
+
+### `COLLATION 'utf8mb4_general_ci' is not valid for CHARACTER SET 'utf8mb3'`
+
+A stricter variant of the same underlying issue: the target isn't just on a different
+*collation*, it's on a different *character set* than `utf8mb4` — `utf8mb3` (MariaDB's name
+for classic 3-byte `utf8`) is the common real case for an older schema that predates
+`utf8mb4` support. A bare `COLLATE utf8mb4_general_ci` doesn't help here (that collation
+doesn't exist for `utf8mb3`), so the current version first `CONVERT(... USING utf8mb4)`s
+the target-schema side before applying it — a safe, lossless promotion. As above, this
+means you're on an older copy of `02-Implementation.sql`; reload it (step 2) and retry.
+Should not recur on the current version for `utf8mb3` or `utf8mb4` targets in any
+collation (a target on a genuinely non-Unicode-compatible character set is out of scope).
 
 ---
 
