@@ -58,7 +58,7 @@ The script assumes:
 | Assumed | Meaning |
 |---|---|
 | `dap_User` | the user table, in the target schema |
-| `dap_User.UserID` | primary key **and** the email address |
+| `dap_User.UserID` | primary key **and** a stripped, local-part-shaped identifier derived from the user's real email (e.g. `Wendy.Boyce` for `Wendy.Boyce@sa.gov.au`) — not the email address itself, but still real PII |
 | `dap_User` columns like `FirstName`, `LastName`, `PhoneNumber`, `Address` | PII to replace |
 | columns named `CreatedBy`, `CreatedUser`, `CreatedUserID`, `ModifiedBy`, `ModifiedUserID` | value-copies of a `UserID` |
 
@@ -71,9 +71,16 @@ If your schema differs:
 - Everything else (which PII columns, which types, and which target schema) is **data**, set
   in `obf_ObfuscationConfig` in step 3 — no code change.
 
-If `dap_User.UserID` is **not** the email (e.g. it's a numeric id and the email is in
-`dap_User.Email`), that is a larger change — tell the author; the mapping generator and the
-reference-rewrite logic are built around "the key is the email".
+`dap_User.UserID` is expected to be a **string-typed** identity key that directly names a
+real person (whether that's the raw email address, or — as in the Appian schema this was
+authored against — a stripped, local-part-shaped value derived from it, e.g. `Wendy.Boyce`
+for `Wendy.Boyce@sa.gov.au`). Either shape works unchanged; the mapping generator and
+reference-rewrite logic are keyed off "whatever `dap_User.UserID` holds", not off it
+specifically being an `@domain` string. If it's instead a **numeric** id with the email/name
+living in a separate column (e.g. `dap_User.Email`), that's a larger change — tell the
+author; obfuscate that column via `obf_ObfuscationConfig` (`EMAIL`/`FIRST_NAME`/etc.)
+instead, and register `UserID` itself as `STATIC`/`HASH` rather than routing it through the
+user-id mapping.
 
 The admin schema name itself (`obf_admin`) is also a fixed constant baked in throughout the
 file — rename it only via a careful global find/replace, since it's hardcoded as a
@@ -126,7 +133,7 @@ INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName
 ```
 
 Notes:
-- `dap_User.UserID` (the primary email) is handled automatically — **do not** add it here.
+- `dap_User.UserID` (the primary identity key) is handled automatically — **do not** add it here.
 - `STATIC` writes one literal to every row; don't use it on a column that has a
   single-column `UNIQUE` index (step 4 will hard-stop you).
 - `HASH` is keyed off the row's stable seed + salt (deterministic, one-way).
@@ -189,13 +196,15 @@ CALL obf_admin.obf_sp_validate_reference_column_lengths('appiandev2', UUID());
 ```
 
 Every column in `obf_UserReferenceRegistry` gets overwritten with the **same** obfuscated
-email that's written to `dap_User.UserID`. `obf_fn_generate_obfuscated_email` caps that value
-at **49 characters, no matter how wide `dap_User.UserID` itself is** (33-char local part +
-16-char `@example.invalid` domain), so any reference column **50 characters or wider** is
-always safe with **no schema change**. Only a column narrower than 50 chars → **hard error**
-(`Data too long for column '<col>'` is exactly this, if you hit it without running this check
-first). Fix by widening the column to 50+, or by disabling that reference column (only if you
-don't actually need it obfuscated — this leaves its original value untouched):
+user id that's written to `dap_User.UserID`. `dap_User.UserID` isn't an email address (see
+§1), so the replacement isn't shaped like one either — `obf_fn_generate_obfuscated_user_id`
+caps that value at **34 characters, no matter how wide `dap_User.UserID` itself is** (a
+33-character hash, split across a `.` to mirror the real value's `Word.Word` shape), so any
+reference column **34 characters or wider** is always safe with **no schema change**. Only
+a column narrower than 34 chars → **hard error** (`Data too long for column '<col>'` is
+exactly this, if you hit it without running this check first). Fix by widening the column
+to 34+, or by disabling that reference column (only if you don't actually need it
+obfuscated — this leaves its original value untouched):
 ```sql
 UPDATE obf_admin.obf_UserReferenceRegistry SET Enabled = FALSE
  WHERE TargetSchema = 'appiandev2' AND TableName = '...' AND ColumnName = '...';
@@ -253,7 +262,7 @@ CALL obf_admin.obf_sp_obfuscate_database(
     'appiandev2',                               -- p_target_schema: the application schema to obfuscate
     'CHANGE-ME-secret-salt-for-this-refresh',   -- p_salt: secret, rotate per refresh cycle
     50000,                                      -- p_batch_size for large-table UPDATEs
-    FALSE                                       -- p_purge_after: strip original emails now?
+    FALSE                                       -- p_purge_after: strip original user ids now?
 );
 ```
 
@@ -264,7 +273,7 @@ CALL obf_admin.obf_sp_obfuscate_database(
   somewhere safe: **a resume run (step 11) must use the exact same salt.** Rotate it
   between independent refresh cycles (per target).
 - **`p_batch_size`** — rows per `UPDATE` on large tables; 50 000 is a sane default.
-- **`p_purge_after`** — `TRUE` overwrites the original emails in `obf_UserObfuscationMapping`
+- **`p_purge_after`** — `TRUE` overwrites the original user ids in `obf_UserObfuscationMapping`
   after validation passes (see step 9). Leave `FALSE` on the first run so you can inspect,
   then purge separately.
 
@@ -304,8 +313,12 @@ The run already does a heuristic residual sweep and a BEFORE/AFTER row-count
 reconciliation. Add your own eyeball checks against the **target** schema, e.g.:
 
 ```sql
--- every user email is now a synthetic one
-SELECT COUNT(*) FROM dap_User WHERE UserID NOT LIKE '%@example.invalid';   -- expect 0
+-- every UserID is now a known obfuscated one (not a string-pattern check --
+-- the obfuscated form has no fixed marker like a real email's '@domain')
+SELECT COUNT(*) FROM appiandev2.dap_User u
+LEFT JOIN obf_admin.obf_UserObfuscationMapping m
+  ON m.TargetSchema = 'appiandev2' AND m.ObfuscatedUserID = u.UserID
+WHERE u.UserID IS NOT NULL AND m.ObfuscatedUserID IS NULL;                -- expect 0
 
 -- no obviously-real names survived
 SELECT UserID, FirstName, LastName, PhoneNumber, Address FROM dap_User LIMIT 50;
@@ -328,7 +341,7 @@ Check any free-text / JSON columns you flagged manually.
 
 ## 10. Lock down the mapping table, then open the environment
 
-`obf_UserObfuscationMapping.OriginalUserID` still holds real email addresses. Choose one:
+`obf_UserObfuscationMapping.OriginalUserID` still holds real user ids (stripped, email-derived identifiers that directly name real people). Choose one:
 
 - **Purge** — no further delta sync planned for this cycle:
   ```sql
@@ -366,8 +379,9 @@ CALL obf_admin.obf_sp_obfuscation_status('appiandev2');
 config row, a trigger calling a stored procedure that doesn't exist in this lower-env
 copy — check `information_schema.TRIGGERS`/`ROUTINES` and either fix or temporarily drop
 the trigger for the run, or — a sample first-run failure — `Data too long for column
-'<col>'`, meaning `<col>` is a registered reference column narrower than the 50-character
-floor per step 4c; widen it to 50+ or `Enabled = FALSE` it, then resume), then **re-run
+'<col>'`, meaning `<col>` is a registered reference column narrower than the 34-character
+floor per step 4c; widen it to 34+ or `Enabled = FALSE` it, then resume; or `Illegal mix of
+collations` — see the troubleshooting note right after this section), then **re-run
 `obf_sp_obfuscate_database` with the exact same salt**:
 
 ```sql
@@ -376,6 +390,20 @@ CALL obf_admin.obf_sp_obfuscate_database('appiandev2', 'CHANGE-ME-secret-salt-fo
 
 Every step is idempotent — the resume finishes the remaining work and restores the FKs.
 It logs a `WARN` ("Resuming after an interrupted/failed run …") so you can see it happened.
+
+### `Illegal mix of collations` (e.g. `(utf8mb4_uca1400_ai_ci,IMPLICIT) and (utf8mb4_general_ci,IMPLICIT)`)
+
+This means the target schema's default collation differs from whatever `obf_admin`'s
+tables/functions picked up when `02-Implementation.sql` was loaded (normally the server's
+default at that time) — common when the target is an older/legacy schema (frequently
+pinned to `utf8mb4_general_ci`) on a server whose default has since moved on. Every
+cross-schema comparison in the framework already forces an explicit
+`COLLATE utf8mb4_general_ci` on the target-schema side specifically to prevent this (see
+"Cross-schema collation safety" in `01-Design-and-Architecture.md` §C) — if you hit this
+error anyway, you're most likely running an **older copy of `02-Implementation.sql`** that
+predates that fix; reload it (step 2) and retry. It should never recur once you're on the
+current version, for any target-schema collation, as long as the target is `utf8mb4`
+charset (a target on a genuinely different character set is out of scope).
 
 ---
 
@@ -408,5 +436,5 @@ Every call's **first argument is the target schema name.**
 | `obf_admin.obf_sp_discover_user_references(target, UUID())` | pre-flight, read-only |
 | `obf_admin.obf_sp_validate_reference_column_lengths(target, UUID())` | pre-flight, read-only — after discovery |
 | `obf_admin.obf_sp_validate_obfuscation(target, UUID())` | re-check an already-run environment |
-| `obf_admin.obf_sp_purge_sensitive_staging(target, UUID())` | strip original emails from the mapping |
+| `obf_admin.obf_sp_purge_sensitive_staging(target, UUID())` | strip original user ids from the mapping |
 | `obf_admin.obf_sp_obfuscation_prune(target, keep_runs)` | trim run history for this target |

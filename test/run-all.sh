@@ -8,7 +8,7 @@
 # Overridable (defaults target the dev container on the native docker engine):
 #   DBOBF_CTX=default|desktop-linux   docker context
 #   DBOBF_CONTAINER=dbobf-mariadb     container name
-#   DBOBF_USER=root  DBOBF_PW=obftest  DBOBF_DB=Appian
+#   DBOBF_USER=root  DBOBF_PW=obftest  DBOBF_DB=AppianTest
 # Example against a Docker Desktop container named "mariadb":
 #   DBOBF_CTX=desktop-linux DBOBF_CONTAINER=mariadb DBOBF_USER=root DBOBF_PW=secret \
 #     bash test/run-all.sh
@@ -17,7 +17,7 @@ set -u
 : "${DBOBF_CONTAINER:=dbobf-mariadb}"
 : "${DBOBF_USER:=root}"
 : "${DBOBF_PW:=obftest}"
-: "${DBOBF_DB:=Appian}"
+: "${DBOBF_DB:=AppianTest}"
 DBOBF_ADMIN_DB="obf_admin"   # must match the hardcoded schema name in 02-Implementation.sql
 DC="docker --context $DBOBF_CTX"
 MYSQL="$DC exec -i $DBOBF_CONTAINER mariadb -u$DBOBF_USER -p$DBOBF_PW"
@@ -61,10 +61,10 @@ echo "### reload implementation"
 $MYSQL -e "DROP DATABASE IF EXISTS \`$DBOBF_ADMIN_DB\`; DROP DATABASE IF EXISTS \`$DBOBF_DB\`; CREATE DATABASE \`$DBOBF_DB\`;" >/dev/null 2>&1
 $MYSQL < "$ROOT/02-Implementation.sql" >/dev/null 2>&1 && echo "  loaded"
 
-echo "### TEST 1  deterministic email generation"
+echo "### TEST 1  deterministic user id generation"
 reset
-chk "same input -> same output" "$(qa "SELECT obf_fn_generate_obfuscated_email('john@test.com','test-salt',0,40)=obf_fn_generate_obfuscated_email('john@test.com','test-salt',0,40);")" "1"
-chk "different input -> different output" "$(qa "SELECT obf_fn_generate_obfuscated_email('john@test.com','test-salt',0,40)<>obf_fn_generate_obfuscated_email('jane@test.com','test-salt',0,40);")" "1"
+chk "same input -> same output" "$(qa "SELECT obf_fn_generate_obfuscated_user_id('john@test.com','test-salt',0,40)=obf_fn_generate_obfuscated_user_id('john@test.com','test-salt',0,40);")" "1"
+chk "different input -> different output" "$(qa "SELECT obf_fn_generate_obfuscated_user_id('john@test.com','test-salt',0,40)<>obf_fn_generate_obfuscated_user_id('jane@test.com','test-salt',0,40);")" "1"
 
 echo "### TEST 2  full run + referential integrity"
 reset
@@ -91,13 +91,13 @@ chk "mapping row count stable at 3" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscat
 
 echo "### TEST 7  collision handling"
 reset
-qa "SET @c:=obf_fn_generate_obfuscated_email('newuser@test.com','test-salt-001',0,238);
+qa "SET @c:=obf_fn_generate_obfuscated_user_id('newuser@test.com','test-salt-001',0,238);
    INSERT INTO obf_UserObfuscationMapping (TargetSchema,OriginalUserID,ObfuscatedUserID,CreatedDate) VALUES('$DBOBF_DB','someone-else@test.com',@c,NOW());
    CALL obf_admin.obf_sp_create_user_mapping('$DBOBF_DB', UUID(),'test-salt-001');" >/dev/null 2>&1
 q "INSERT INTO dap_User(UserID,FirstName,LastName) VALUES('newuser@test.com','New','User');" >/dev/null
 qa "CALL obf_admin.obf_sp_create_user_mapping('$DBOBF_DB', UUID(),'test-salt-001');" >/dev/null
 chk "newuser mapped despite attempt-0 collision" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB' AND OriginalUserID='newuser@test.com';")" "1"
-chk "and NOT to the colliding value" "$(qa "SET @c:=obf_fn_generate_obfuscated_email('newuser@test.com','test-salt-001',0,238); SELECT ObfuscatedUserID<>@c FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB' AND OriginalUserID='newuser@test.com';")" "1"
+chk "and NOT to the colliding value" "$(qa "SET @c:=obf_fn_generate_obfuscated_user_id('newuser@test.com','test-salt-001',0,238); SELECT ObfuscatedUserID<>@c FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB' AND OriginalUserID='newuser@test.com';")" "1"
 
 echo "### TEST 8  bad config rejected before mutation"
 reset
@@ -112,7 +112,7 @@ chk "obf_ObfuscationRun row = FAILED" "$(qa "SELECT Status FROM obf_ObfuscationR
 echo "### TEST 9  validation catches a deliberately broken state"
 reset
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
-q "SET FOREIGN_KEY_CHECKS=0; INSERT INTO dap_Actor (UserID,CreatedBy,FirstName,LastName) VALUES ('nonexistent@example.invalid',NULL,'X','Y'); SET FOREIGN_KEY_CHECKS=1;" >/dev/null
+q "SET FOREIGN_KEY_CHECKS=0; INSERT INTO dap_Actor (UserID,CreatedBy,FirstName,LastName) VALUES ('nonexistent-obfuscated-value',NULL,'X','Y'); SET FOREIGN_KEY_CHECKS=1;" >/dev/null
 RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_validate_obfuscation('$DBOBF_DB', UUID());" >/dev/null 2>&1; echo $?)
 chk "obf_sp_validate_obfuscation raises" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)" "1"
 
@@ -168,7 +168,8 @@ chk "12b row-count change -> raises" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)" "1
 reset
 qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
 RID=$(qa "SELECT RunID FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB' ORDER BY StartedAt DESC LIMIT 1;")
-q "UPDATE dap_User SET FirstName='Zoltan' WHERE UserID LIKE '%@example.invalid' LIMIT 1;" >/dev/null
+q "UPDATE dap_User SET FirstName='Zoltan'
+   WHERE UserID IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB') LIMIT 1;" >/dev/null
 RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_validate_obfuscation('$DBOBF_DB', '$RID');" >/dev/null 2>&1; echo $?)
 chk "12c residual name -> raises" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)" "1"
 
@@ -243,12 +244,12 @@ chk "16a narrow ref column -> orchestrator errors out" "$([ "$RC" -ne 0 ] && ech
 chk "16b: FK not yet dropped (caught before any destructive step)" "$(q "SELECT COUNT(*) FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_NAME='FK_Actor_User';")" "1"
 chk "16c: log names the offending column" "$(qa "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB' AND StepName='obf_sp_validate_reference_column_lengths' AND Message LIKE '%dap_Actor.CreatedBy%';")" "1"
 
-echo "### TEST 17  obfuscated user id never crosses 50 chars -> VARCHAR(50) needs no schema change"
+echo "### TEST 17  obfuscated user id never crosses 34 chars -> VARCHAR(34) needs no schema change"
 reset
-q "ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(50);" >/dev/null
+q "ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(34);" >/dev/null
 RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null 2>&1; echo $?)
-chk "17a VARCHAR(50) ref column -> run succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)" "1"
-chk "17b: obfuscated CreatedBy fits in 50 chars" "$(q "SELECT MAX(LENGTH(CreatedBy))<=50 FROM dap_Actor;")" "1"
+chk "17a VARCHAR(34) ref column -> run succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)" "1"
+chk "17b: obfuscated CreatedBy fits in 34 chars" "$(q "SELECT MAX(LENGTH(CreatedBy))<=34 FROM dap_Actor;")" "1"
 
 echo "### TEST 18  obf_TableSeedOverride unblocks a table with no PRIMARY KEY"
 reset
@@ -271,8 +272,8 @@ qa "INSERT INTO obf_ObfuscationConfig (TargetSchema, TableName, ColumnName, Obfu
      ('$DBOBF_DB2','dap_User','FirstName','FIRST_NAME'),('$DBOBF_DB2','dap_User','LastName','LAST_NAME');
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB', 'salt-target-1', 10000, FALSE);
    CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB2','salt-target-2', 10000, FALSE);" >/dev/null
-chk "19a target 1 obfuscated" "$(q "SELECT COUNT(*) FROM dap_User WHERE UserID LIKE '%@example.invalid';")" "3"
-chk "19b target 2 obfuscated independently" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB2}.dap_User WHERE UserID LIKE '%@example.invalid';")" "3"
+chk "19a target 1 obfuscated" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB' AND m.ObfuscatedUserID=u.UserID;")" "3"
+chk "19b target 2 obfuscated independently" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB2}.dap_User u JOIN obf_UserObfuscationMapping m ON m.TargetSchema='$DBOBF_DB2' AND m.ObfuscatedUserID=u.UserID;")" "3"
 chk "19c mapping rows fully isolated per target" "$(qa "SELECT COUNT(DISTINCT TargetSchema) FROM obf_UserObfuscationMapping WHERE TargetSchema IN ('$DBOBF_DB','$DBOBF_DB2');")" "2"
 chk "19d target 1's ObfuscatedUserID differs from target 2's for the same email" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping m1 JOIN obf_UserObfuscationMapping m2 ON m1.OriginalUserID=m2.OriginalUserID WHERE m1.TargetSchema='$DBOBF_DB' AND m2.TargetSchema='$DBOBF_DB2' AND m1.ObfuscatedUserID=m2.ObfuscatedUserID;")" "0"
 chk "19e target 2 run status independent COMPLETED" "$(qa "SELECT Status FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB2' ORDER BY StartedAt DESC LIMIT 1;")" "COMPLETED"
@@ -283,6 +284,29 @@ qa "DELETE FROM obf_ObfuscationConfig WHERE TargetSchema='$DBOBF_DB2';
    DELETE FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB2';
    DELETE FROM obf_ObfuscationRowCountSnapshot WHERE TargetSchema='$DBOBF_DB2';
    DELETE FROM obf_UserReferenceRegistry WHERE TargetSchema='$DBOBF_DB2';" >/dev/null 2>&1
+
+echo "### TEST 20  target schema on a different collation than obf_admin (e.g. legacy utf8mb4_general_ci vs a newer server default) doesn't hit 'Illegal mix of collations'"
+DBOBF_DB3="${DBOBF_DB}_ci"
+$MYSQL -e "DROP DATABASE IF EXISTS \`$DBOBF_DB3\`; CREATE DATABASE \`$DBOBF_DB3\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;" >/dev/null 2>&1
+$MYSQL $DBOBF_DB3 < "$ROOT/test/reset.sql" >/dev/null 2>&1
+qa "INSERT INTO obf_ObfuscationConfig (TargetSchema, TableName, ColumnName, ObfuscationType) VALUES
+     ('$DBOBF_DB3','dap_User','FirstName','FIRST_NAME'),('$DBOBF_DB3','dap_User','LastName','LAST_NAME'),
+     ('$DBOBF_DB3','dap_User','PhoneNumber','PHONE'),('$DBOBF_DB3','dap_User','Address','ADDRESS'),
+     ('$DBOBF_DB3','dap_Actor','FirstName','FIRST_NAME'),('$DBOBF_DB3','dap_Actor','LastName','LAST_NAME');" >/dev/null
+RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB3','test-salt-ci',10000,FALSE);" >/dev/null 2>&1; echo $?)
+chk "20a run against a differently-collated target succeeds" "$([ "$RC" -eq 0 ] && echo 1 || echo 0)" "1"
+S1=$($MYSQL $DBOBF_DB3 -N -e "SELECT SHA2(GROUP_CONCAT(UserID,FirstName,LastName,PhoneNumber,Address ORDER BY UserID),256) FROM dap_User;")
+RC=$($MYSQL $DBOBF_ADMIN_DB -e "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB3','test-salt-ci',10000,FALSE);" >/dev/null 2>&1; echo $?)
+S2=$($MYSQL $DBOBF_DB3 -N -e "SELECT SHA2(GROUP_CONCAT(UserID,FirstName,LastName,PhoneNumber,Address ORDER BY UserID),256) FROM dap_User;")
+chk "20b second run against it is still idempotent" "$([ "$RC" -eq 0 ] && [ "$S1" = "$S2" ] && echo 1 || echo 0)" "1"
+chk "20c mapping row count stable at 3 (no spurious re-mapping)" "$(qa "SELECT COUNT(*) FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB3';")" "3"
+$MYSQL -e "DROP DATABASE IF EXISTS \`$DBOBF_DB3\`;" >/dev/null 2>&1
+qa "DELETE FROM obf_ObfuscationConfig WHERE TargetSchema='$DBOBF_DB3';
+   DELETE FROM obf_UserObfuscationMapping WHERE TargetSchema='$DBOBF_DB3';
+   DELETE FROM obf_ObfuscationRun WHERE TargetSchema='$DBOBF_DB3';
+   DELETE FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB3';
+   DELETE FROM obf_ObfuscationRowCountSnapshot WHERE TargetSchema='$DBOBF_DB3';
+   DELETE FROM obf_UserReferenceRegistry WHERE TargetSchema='$DBOBF_DB3';" >/dev/null 2>&1
 
 echo
 echo "======================================"

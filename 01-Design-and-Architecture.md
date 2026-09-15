@@ -3,6 +3,14 @@
 Target: MariaDB, lower-environment copy of the Appian production schema (target schema —
 e.g. `Appian`, `appiandev2`).
 
+**`dap_User.UserID` is not an email address.** It's a stripped, local-part-shaped
+identifier derived from the user's real email (e.g. `Wendy.Boyce` for
+`Wendy.Boyce@sa.gov.au`) — no `@domain`. It still directly names a real person, so it
+still gets fully obfuscated everywhere it's used as an identity key (`dap_User.UserID`
+itself and every discovered/registered reference column); the obfuscated replacement is
+just shaped to match — a `Word.Word`-style token with no `@domain` suffix, since the
+original never had one either. See "Obfuscated-id length ceiling" in §C for the generator.
+
 ---
 
 ## A. Proposed Architecture
@@ -25,7 +33,7 @@ The framework's moving parts (all in `obf_admin`, each state table scoped by a
 |---|---|
 | `obf_ObfuscationConfig` | Declares which `(TargetSchema, TableName, ColumnName)` triples get obfuscated and how (`ObfuscationType`). Drives everything — no hard-coded column lists in the procedures. |
 | `obf_UserReferenceRegistry` | Auto-discovered (+ manually confirmed) list of every column, per target schema, that stores a `dap_User.UserID` value — FK-based and convention-based (`CreatedBy`, `ModifiedBy`, etc.). Each row also carries an `OrphanAction` (`OBFUSCATE` default / `NULLIFY` / `IGNORE`) deciding what happens to a value in that column that matches no real `dap_User`. |
-| `obf_UserObfuscationMapping` | The one-to-one original→obfuscated email mapping, per target schema (`PRIMARY KEY (TargetSchema, OriginalUserID)`). Deterministic, salted SHA-256 based. This table holds real PII and is the only place that does — see §C for lifecycle handling. |
+| `obf_UserObfuscationMapping` | The one-to-one original→obfuscated user id mapping, per target schema (`PRIMARY KEY (TargetSchema, OriginalUserID)`). Deterministic, salted SHA-256 based. This table holds real PII and is the only place that does — see §C for lifecycle handling. |
 | `obf_TableSeedOverride` | Per-target, DBA-registered `(TargetSchema, TableName) → ColumnName` mapping used as a last-resort deterministic seed for a table that has neither a registered user-reference column nor a formal `PRIMARY KEY` (real legacy/staging tables sometimes have an unmistakable `id`/`XxxID` column that was simply never declared as a key constraint) — avoids requiring a target-schema DDL change just to unblock obfuscation. |
 | `Synthetic*` reference tables | Small seed tables (`obf_SyntheticFirstName`, `obf_SyntheticLastName`, `obf_SyntheticStreetAddress`) used to build "meaningful-looking" replacement names/addresses, selected deterministically per-user (not per-value). **Global** — shared across every target schema, not scoped by `TargetSchema`, since the seed pool has no reason to be duplicated per target. Extend freely; `SeedID` only has to be unique. |
 | `obf_FkConstraintBackup` | Exact definitions of FK constraints while they are dropped mid-run, per target. Transient — the orchestrator discards already-restored rows for a target at the start of every run against it; a non-empty set of un-restored rows for a target means a run against it stopped between FK drop and restore. |
@@ -167,7 +175,7 @@ Snapshot row counts (BEFORE)  ──►  obf_ObfuscationRowCountSnapshot
         │
         ▼
 Build User Mapping  ──►  obf_UserObfuscationMapping
-   (deterministic SHA-256(salt || email) → synthetic email, collision-checked)
+   (deterministic SHA-256(salt || UserID) → synthetic user id, collision-checked)
         │
         ▼
 Report orphan references   (read-only diagnostic: reference-column values with no
@@ -217,8 +225,8 @@ every admin-side state table that isn't a genuinely shared seed pool carries a
 `TargetSchema` column and is keyed/queried by it: `obf_ObfuscationConfig` and
 `obf_UserReferenceRegistry` are unique per `(TargetSchema, TableName, ColumnName)`;
 `obf_UserObfuscationMapping`'s primary key is `(TargetSchema, OriginalUserID)` (so the same
-real email maps independently, and typically to a *different* obfuscated value, per target
-— each target normally uses its own salt); `obf_TableSeedOverride` is keyed by
+real user id maps independently, and typically to a *different* obfuscated value, per
+target — each target normally uses its own salt); `obf_TableSeedOverride` is keyed by
 `(TargetSchema, TableName)`. Crucially, every "what's the last/currently-running run"
 query in `obf_sp_obfuscate_database` (superseding a stale `RUNNING` row, detecting a resume,
 picking up the previous salt) and in `obf_sp_obfuscation_status()` filters by
@@ -230,16 +238,18 @@ to duplicate the seed data per target and one shared pool is easier to extend.
 **Obfuscated-id length ceiling.** `obf_sp_obfuscate_user_references` writes the *same*
 obfuscated value into every registered reference column that it writes into
 `dap_User.UserID` (no per-column truncation — truncating differently per column would let
-two different users' emails collide on a narrow column). `obf_fn_generate_obfuscated_email`
-therefore caps its output at **49 characters total** (a 33-character hash local-part + the
-16-character `@example.invalid` domain), **regardless of how wide `dap_User.UserID` itself
-is** — so any reference column 50 characters or wider is always safe, with no schema
-change required. `obf_sp_validate_reference_column_lengths` (run right after discovery,
-before any destructive step) computes the same ceiling and hard-stops if any registered
-reference column is narrower than it, naming the offending `table.column` and its current
-vs. required width — this is deliberately a pre-flight check rather than letting the
-narrow column surface as a raw `Data too long for column` error mid-run, after FKs have
-already been dropped.
+two different users' obfuscated ids collide on a narrow column). `dap_User.UserID` is not
+an email address (see the note at the top of this document), so the replacement is not
+shaped like one either: `obf_fn_generate_obfuscated_user_id` caps its output at **34
+characters total** — a 33-character hash, split across a `.` into two segments so the
+result mirrors the real value's `Word.Word` shape — **regardless of how wide
+`dap_User.UserID` itself is** — so any reference column 34 characters or wider is always
+safe, with no schema change required. `obf_sp_validate_reference_column_lengths` (run right
+after discovery, before any destructive step) computes the same ceiling and hard-stops if
+any registered reference column is narrower than it, naming the offending `table.column`
+and its current vs. required width — this is deliberately a pre-flight check rather than
+letting the narrow column surface as a raw `Data too long for column` error mid-run, after
+FKs have already been dropped.
 
 **Tables with no formal PRIMARY KEY.** `obf_sp_obfuscate_configured_columns` needs a
 stable per-row seed to generate deterministic synthetic values: it prefers a registered
@@ -261,17 +271,19 @@ This is safer than disabling checks because a broken mapping surfaces as a hard 
 
 **Unique constraints.** `obf_UserObfuscationMapping.ObfuscatedUserID` has a `UNIQUE` key. Generation logic retries with an extra salt component on collision (astronomically unlikely with SHA-256, but handled, not assumed away — the first mapping insert is `INSERT IGNORE` so an attempt-0 collision falls through to the retry loop rather than aborting). Any other `UNIQUE` constraint on a configured PII column (e.g. a unique index on `Email`) is detected by `obf_sp_validate_config()` from `information_schema.STATISTICS` before that column is processed: every case is logged as a `WARN` (obfuscated values must stay unique or the run fails with a duplicate-key error), and the one guaranteed failure — `STATIC` (one literal for all rows) on a single-column unique index with more than one row — is a hard `SIGNAL 45000` before any mutation. Multi-column unique indexes stay warnings, since per-component-unique obfuscation can still satisfy them.
 
-**Reference-column datatype.** `dap_User.UserID` is assumed string-typed (it holds the email). `obf_sp_discover_user_references()` flags any registered reference column whose datatype is not string-like (e.g. a numeric `CreatedBy` that is not actually a UserID copy) — a `WARN` plus a `TypeLooksCompatible` column in its diagnostic result set — so the DBA can `Enabled = FALSE` it before it is obfuscated into an email. (`obf_sp_validate_config()` extension to make this fatal is a noted follow-up.)
+**Reference-column datatype.** `dap_User.UserID` is assumed string-typed (it holds a stripped, email-derived identifier). `obf_sp_discover_user_references()` flags any registered reference column whose datatype is not string-like (e.g. a numeric `CreatedBy` that is not actually a UserID copy) — a `WARN` plus a `TypeLooksCompatible` column in its diagnostic result set — so the DBA can `Enabled = FALSE` it before it is obfuscated into a synthetic user id. (`obf_sp_validate_config()` extension to make this fatal is a noted follow-up.)
 
 **Row-count reconciliation.** `obf_sp_obfuscate_database()` snapshots `COUNT(*)` for `dap_User` and every config/registry table into `obf_ObfuscationRowCountSnapshot` (phase `BEFORE`) right after discovery; `obf_sp_validate_obfuscation()` re-snapshots (`AFTER`) and `SIGNAL`s if any table's count changed — nothing in the framework should add or remove rows, so a delta means a trigger or a bug. A standalone `obf_sp_validate_obfuscation()` call with a `RunID` that has no `BEFORE` snapshot logs `SKIP` for this check rather than failing.
 
-**Residual-PII spot checks.** `obf_sp_validate_obfuscation()` also runs a heuristic sweep: `dap_User.UserID` (and configured `EMAIL` columns) must end `@example.invalid`; configured `FIRST_NAME`/`LAST_NAME`/`ADDRESS` values must come from the `Synthetic*` pool; configured `PHONE` values must match the generator's `04########` shape. Any violation `SIGNAL`s. This is a backstop for "a step silently didn't run", not a guarantee — it cannot detect a residual value that already resembles the synthetic domain, and it makes no assertion about `STATIC`/`HASH` columns.
+**Residual-PII spot checks.** `obf_sp_validate_obfuscation()` also runs a heuristic sweep: `dap_User.UserID` must be a known `ObfuscatedUserID` in `obf_UserObfuscationMapping` (checked against the mapping table itself, not a string pattern — unlike a real email, its obfuscated form has no fixed marker like `@example.invalid` to match against); configured `EMAIL` columns must end `@example.invalid`; configured `FIRST_NAME`/`LAST_NAME`/`ADDRESS` values must come from the `Synthetic*` pool; configured `PHONE` values must match the generator's `04########` shape. Any violation `SIGNAL`s. This is a backstop for "a step silently didn't run", not a guarantee — it cannot detect a residual value that happens to coincide with an obfuscated one, and it makes no assertion about `STATIC`/`HASH` columns.
 
 **NULLs.** Every obfuscation routine explicitly skips `NULL` source values (`WHERE source_column IS NOT NULL`) rather than obfuscating `NULL` into a placeholder string — a `NULL` email/phone/name stays `NULL`.
 
 **Duplicate names across users.** Per the spec, "John Smith / John Brown / John Taylor" must not collapse into the same synthetic identity just because they share a first name. Synthetic name selection is therefore keyed off **the user's obfuscated identity**, not off the literal `FirstName`/`LastName` value — `CRC32(SHA2(CONCAT(salt, UserID_or_row_key), 256))` picks the synthetic name index. Same user always gets the same synthetic name across a re-run (determinism); different users with the same real first name get independently chosen synthetic names.
 
-**Case sensitivity / collation.** The framework does not rely on the schema's default collation to match email values across case. `obf_UserObfuscationMapping.OriginalUserID` is stored `LOWER()`-cased (and `obf_fn_generate_obfuscated_email()` lowercases its hash input), so `John@x.com` and `john@x.com` always resolve to the same obfuscated value. Every join from a user-reference column back to the mapping is written `m.OriginalUserID = LOWER(t.<col>)` — the function sits only on the (already-scanned) reference-column side, so the mapping-table primary key stays usable for the lookup. `obf_sp_create_user_mapping()` first refuses (`SIGNAL 45000`) if `dap_User` holds rows that differ only by `UserID` letter case — impossible under a case-insensitive PK, but a `*_bin` / `*_cs` collation would allow it, and silently merging two real users is worse than a hard stop.
+**Case sensitivity / collation.** The framework does not rely on the schema's default collation to match user id values across case. `obf_UserObfuscationMapping.OriginalUserID` is stored `LOWER()`-cased (and `obf_fn_generate_obfuscated_user_id()` lowercases its hash input), so `John.Smith` and `john.smith` always resolve to the same obfuscated value. Every join from a user-reference column back to the mapping is written `m.OriginalUserID = LOWER(t.<col>)` — the function sits only on the (already-scanned) reference-column side, so the mapping-table primary key stays usable for the lookup. `obf_sp_create_user_mapping()` first refuses (`SIGNAL 45000`) if `dap_User` holds rows that differ only by `UserID` letter case — impossible under a case-insensitive PK, but a `*_bin` / `*_cs` collation would allow it, and silently merging two real users is worse than a hard stop.
+
+**Cross-schema collation safety.** `obf_admin`'s own string columns (and its generator functions' `RETURNS` types) take whatever collation was in effect when `02-Implementation.sql` was loaded — normally the server's default. A target schema is very often *not* on that same collation (a common real case: a legacy application schema pinned to `utf8mb4_general_ci` on a server whose default has since moved to something newer) — and MariaDB raises `SQLSTATE HY000` ("Illegal mix of collations ... for operation '='") the moment two *different* "implicit" (i.e., column-default) collations meet in a comparison, which is exactly what every mapping-table join does: an `obf_admin` column against a target-schema column. Every such comparison in the framework — the `obf_UserObfuscationMapping` joins in `obf_sp_create_user_mapping`, `obf_sp_report_orphan_user_references`, `obf_sp_resolve_orphan_user_references`, `obf_sp_obfuscate_user_references`, `obf_sp_obfuscate_user_table`, and `obf_sp_validate_obfuscation`'s stray/residual checks, plus the `Synthetic*` pool lookups in the residual-PII sweep — therefore forces the target-schema side of the comparison to an explicit `COLLATE utf8mb4_general_ci`. This is safe regardless of the target's *actual* declared collation (an explicit `COLLATE` always resolves the ambiguity, since it out-ranks either side's implicit one) and doesn't change matching semantics here, since every one of these comparisons already normalizes case via `LOWER()` or compares already-lowercase generated values. The one assumption this does carry forward: every column compared this way must be `utf8mb4`-charset (true throughout this framework's own tables and the `dap_User`/reference columns it targets) — a target on a different character set entirely is out of scope, same as it always implicitly was.
 
 **Large tables / long-running transactions.** Config-driven column updates are batched (configurable batch size, default 50,000 rows) via a `LIMIT`-based loop keyed on primary key, rather than one massive single-statement `UPDATE`, to avoid long lock waits and huge rollback segments on multi-million-row Appian process/audit tables.
 
@@ -283,7 +295,7 @@ This is safer than disabling checks because a broken mapping surfaces as a hard 
 
 **Orphan user-reference values.** A value in a naming-convention or manually-registered reference column need not correspond to a live `dap_User` row — departed users, `'SYSTEM'`/`'batch'` sentinels, legacy bad data. FK-discovered columns can't have these (the constraint forbids it), but audit columns routinely do. Such a value would get no mapping row, so a plain `UPDATE ... JOIN mapping` would silently leave the **original** in place. The framework therefore: (1) runs `obf_sp_report_orphan_user_references()` *before* any destructive step, emitting every offending `(table, column, value, row count)` as a diagnostic result set plus a `WARN` in `obf_ObfuscationRunLog`; and (2) runs `obf_sp_resolve_orphan_user_references()` which, per each column's `obf_UserReferenceRegistry.OrphanAction`, either **OBFUSCATE**s the stray (synthesise a mapping row → it is replaced like any other reference; default, so no original survives even if the DBA does nothing), **NULLIFY**s it, or **IGNORE**s it (left in place and exempted from the post-run check — only choose this after seeing the report and confirming the value is non-sensitive). Because strays are handled up front, `obf_sp_validate_obfuscation()` failing now means *this run* left something inconsistent, not that the source data was already imperfect; its error message says the run is incomplete and can be resumed by re-running `obf_sp_obfuscate_database()`.
 
-Known gap: if a naming-convention column's real datatype isn't the `dap_User.UserID` domain (e.g. a numeric `CreatedBy`), *every* value looks like a stray and OBFUSCATE would rewrite it into a synthetic email. `obf_sp_validate_config()` should be extended to reject discovered reference columns that aren't type-compatible with `dap_User.UserID`.
+Known gap: if a naming-convention column's real datatype isn't the `dap_User.UserID` domain (e.g. a numeric `CreatedBy`), *every* value looks like a stray and OBFUSCATE would rewrite it into a synthetic user id. `obf_sp_validate_config()` should be extended to reject discovered reference columns that aren't type-compatible with `dap_User.UserID`.
 
 **Unexpected user references.** Because discovery is metadata-driven and re-run every execution (not a one-off manual list), a newly added column that follows convention or has an FK to `dap_User` is picked up automatically. `obf_sp_discover_user_references()` also emits a diagnostic result set the DBA can eyeball before the destructive steps run.
 

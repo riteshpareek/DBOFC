@@ -9,7 +9,7 @@
 -- against (it need not be "current"; the CALLs work from any connection).
 -- =====================================================================
 
-SET @target = 'Appian';   -- <-- change to your disposable target schema name
+SET @target = 'AppianTest';   -- <-- change to your disposable target schema name
 
 -- ---------------------------------------------------------------------
 -- TEST 0: Minimal fixture (skip if testing against a real lower-env copy)
@@ -50,16 +50,16 @@ SET @target = 'Appian';   -- <-- change to your disposable target schema name
 --   Same input -> same output, every time. (Run against obf_admin.)
 -- ---------------------------------------------------------------------
 SELECT
-    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_1,
-    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS run_2,
-    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) =
-    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) AS is_deterministic;
+    obf_fn_generate_obfuscated_user_id('john@test.com', 'test-salt', 0, 40) AS run_1,
+    obf_fn_generate_obfuscated_user_id('john@test.com', 'test-salt', 0, 40) AS run_2,
+    obf_fn_generate_obfuscated_user_id('john@test.com', 'test-salt', 0, 40) =
+    obf_fn_generate_obfuscated_user_id('john@test.com', 'test-salt', 0, 40) AS is_deterministic;
 -- EXPECT: run_1 = run_2, is_deterministic = 1
 
 -- Different input -> (near-certainly) different output.
 SELECT
-    obf_fn_generate_obfuscated_email('john@test.com', 'test-salt', 0, 40) <>
-    obf_fn_generate_obfuscated_email('jane@test.com', 'test-salt', 0, 40) AS differs_by_input;
+    obf_fn_generate_obfuscated_user_id('john@test.com', 'test-salt', 0, 40) <>
+    obf_fn_generate_obfuscated_user_id('jane@test.com', 'test-salt', 0, 40) AS differs_by_input;
 -- EXPECT: differs_by_input = 1
 
 -- ---------------------------------------------------------------------
@@ -87,7 +87,7 @@ WHERE CONSTRAINT_SCHEMA = DATABASE()
 -- ---------------------------------------------------------------------
 -- TEST 3: Consistent mapping across tables (target schema)
 --   dap_User.UserID and dap_Actor.CreatedBy that originally held the
---   same email must hold the same obfuscated email afterward.
+--   same user id must hold the same obfuscated user id afterward.
 -- ---------------------------------------------------------------------
 SELECT
     u.UserID AS user_table_value,
@@ -95,7 +95,7 @@ SELECT
     (u.UserID = a.CreatedBy) AS values_match
 FROM dap_User u
 JOIN dap_Actor a ON a.CreatedBy = u.UserID;
--- EXPECT: values_match = 1 for every row (both now hold the SAME obfuscated email)
+-- EXPECT: values_match = 1 for every row (both now hold the SAME obfuscated user id)
 
 -- ---------------------------------------------------------------------
 -- TEST 4: PII replacement — no original values remain (target schema)
@@ -142,7 +142,7 @@ FROM dap_User;
 --   user, then confirm the retry logic (attempt 1+) produces a
 --   different, still-deterministic value instead of failing.
 -- ---------------------------------------------------------------------
--- SET @collide_target = obf_fn_generate_obfuscated_email('newuser@test.com', 'test-salt-001', 0, 40);
+-- SET @collide_target = obf_fn_generate_obfuscated_user_id('newuser@test.com', 'test-salt-001', 0, 40);
 -- INSERT INTO obf_UserObfuscationMapping (TargetSchema, OriginalUserID, ObfuscatedUserID, CreatedDate)
 --   VALUES (@target, 'someone-else@test.com', @collide_target, NOW());
 -- INSERT INTO <target schema>.dap_User (UserID, FirstName, LastName) VALUES ('newuser@test.com', 'New', 'User');
@@ -167,11 +167,11 @@ FROM dap_User;
 -- ---------------------------------------------------------------------
 -- (against the target schema)
 -- INSERT INTO dap_Actor (UserID, CreatedBy, FirstName, LastName)
---   VALUES ('nonexistent-obfuscated-value@example.invalid', NULL, 'X', 'Y');
+--   VALUES ('nonexistent-obfuscated-value', NULL, 'X', 'Y');
 -- (against obf_admin)
 -- CALL obf_admin.obf_sp_validate_obfuscation(@target, UUID());
 -- EXPECT: SQLSTATE 45000 raised, obf_ObfuscationRunLog shows the orphan count for dap_Actor.UserID.
--- DELETE FROM dap_Actor WHERE UserID = 'nonexistent-obfuscated-value@example.invalid'; -- cleanup (target schema)
+-- DELETE FROM dap_Actor WHERE UserID = 'nonexistent-obfuscated-value'; -- cleanup (target schema)
 
 -- ---------------------------------------------------------------------
 -- TEST 10: Orphan user-reference values (pre-existing values in a
@@ -270,7 +270,8 @@ FROM dap_User;
 
 -- 12c. A real value left behind in a configured column is caught.
 -- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);  -- capture @rid
--- UPDATE dap_User SET FirstName = 'Zoltan' WHERE UserID LIKE '%@example.invalid' LIMIT 1;  -- target
+-- UPDATE dap_User SET FirstName = 'Zoltan'                                                  -- target
+--   WHERE UserID IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema=@target) LIMIT 1;
 -- CALL obf_admin.obf_sp_validate_obfuscation(@target, @rid);
 -- EXPECT: SQLSTATE 45000; log line names dap_User.FirstName (FIRST_NAME) as residual PII.
 
@@ -375,21 +376,21 @@ FROM dap_User;
 --   caught pre-flight, before any destructive step (FK drop included).
 -- ---------------------------------------------------------------------
 -- (reset fixture)
--- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(20);   -- narrower than the obfuscated email needs (target)
+-- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(20);   -- narrower than the obfuscated user id needs (target)
 -- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);   -- obf_admin
 -- EXPECT: SQLSTATE 45000 from obf_sp_validate_reference_column_lengths; FK_Actor_User
 --   still present in information_schema.TABLE_CONSTRAINTS (nothing destructive ran);
 --   obf_ObfuscationRunLog names dap_Actor.CreatedBy with its current/required length.
 
 -- ---------------------------------------------------------------------
--- TEST 17: The obfuscated user id never crosses 50 characters, so a
---   VARCHAR(50) reference column succeeds with NO schema change.
+-- TEST 17: The obfuscated user id never crosses 34 characters, so a
+--   VARCHAR(34) reference column succeeds with NO schema change.
 -- ---------------------------------------------------------------------
 -- (reset fixture)
--- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(50);   -- target schema
+-- ALTER TABLE dap_Actor MODIFY CreatedBy VARCHAR(34);   -- target schema
 -- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);   -- obf_admin
 -- EXPECT: run succeeds (no SQLSTATE 45000).
--- SELECT MAX(LENGTH(CreatedBy)) FROM dap_Actor;   -- EXPECT: <= 50 (currently 49)
+-- SELECT MAX(LENGTH(CreatedBy)) FROM dap_Actor;   -- EXPECT: <= 34 (currently 34)
 
 -- ---------------------------------------------------------------------
 -- TEST 18: obf_TableSeedOverride unblocks a configured column on a table
@@ -420,7 +421,23 @@ FROM dap_User;
 -- SELECT COUNT(*) FROM obf_UserObfuscationMapping m1 JOIN obf_UserObfuscationMapping m2
 --   ON m1.OriginalUserID = m2.OriginalUserID
 --   WHERE m1.TargetSchema = @target AND m2.TargetSchema = @target2 AND m1.ObfuscatedUserID = m2.ObfuscatedUserID;
--- EXPECT: 0 -- same original email maps to a DIFFERENT obfuscated value per target (different salts).
+-- EXPECT: 0 -- same original user id maps to a DIFFERENT obfuscated value per target (different salts).
+
+-- ---------------------------------------------------------------------
+-- TEST 20: Target schema on a different collation than obf_admin (e.g. a
+--   legacy schema pinned to utf8mb4_general_ci against a server whose
+--   default has since moved to something newer) must not raise "Illegal
+--   mix of collations" -- every cross-schema comparison in the framework
+--   forces an explicit COLLATE on the target-schema side (see
+--   "Cross-schema collation safety" in 01-Design-and-Architecture.md §C).
+-- ---------------------------------------------------------------------
+-- CREATE DATABASE AppianCI CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+-- (build the TEST 0 fixture in AppianCI; configure it in obf_ObfuscationConfig with TargetSchema='AppianCI')
+-- CALL obf_admin.obf_sp_obfuscate_database('AppianCI', 'test-salt-ci', 10000, FALSE);
+-- EXPECT: run succeeds (no SQLSTATE HY000 "Illegal mix of collations").
+-- CALL obf_admin.obf_sp_obfuscate_database('AppianCI', 'test-salt-ci', 10000, FALSE);   -- run again
+-- EXPECT: still succeeds; dap_User state unchanged (idempotent); mapping row count still 3
+--   (no spurious re-mapping of already-obfuscated values as new "originals").
 
 -- ---------------------------------------------------------------------
 -- Review the full run history for a target at any point (run against obf_admin):

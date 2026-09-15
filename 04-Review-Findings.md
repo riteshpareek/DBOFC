@@ -7,14 +7,18 @@ every concrete case in `03-Test-Plan.sql`.
 > **fixed** in `02-Implementation.sql` and re-verified; F13–F17 are doc-accuracy notes. The
 > framework was later split into a dedicated `obf_admin` schema with multi-target support
 > — see "Admin-schema migration review" at the bottom for that pass's findings (M1–M3, all
-> fixed).
+> fixed). A fourth pass corrected a wrong assumption about `dap_User.UserID` — see
+> "UserID-is-not-an-email correction" — and testing that surfaced an unrelated cross-schema
+> collation bug, fixed in the same pass — see "Cross-schema collation bug" — both at the
+> very bottom.
 >
 > The whole plan runs as assertions via `bash test/run-all.sh` (drops the admin schema and
-> a target database, reloads `02-Implementation.sql`, exercises Tests 1–19, including a
-> dedicated multi-target isolation test) — currently **63/63 pass**. (Historical note: this
-> banner read 49/49 against the pre-migration, single-schema version of the framework —
-> see individual findings below for their original verification counts, which remain
-> accurate for what they tested at the time.)
+> a target database, reloads `02-Implementation.sql`, exercises Tests 1–20, including a
+> dedicated multi-target isolation test and a collation-mismatch regression test) —
+> currently **66/66 pass**. (Historical note: this banner read 49/49 against the
+> pre-migration, single-schema version of the framework, then 63/63 after the admin-schema
+> migration — see individual findings below for their original verification counts, which
+> remain accurate for what they tested at the time.)
 
 ## Test results at a glance
 
@@ -493,9 +497,11 @@ surfaced two problems that were already latent in that lower-environment copy, i
 of obfuscation:
 - **10 audit columns narrower than the obfuscated-id ceiling** (`VARCHAR(50)` against a
   57-character requirement at the time) — this is what motivated capping the generated id
-  at 49 characters (see F-equivalent fix in `02-Implementation.sql`'s
-  `obf_fn_generate_obfuscated_email`, documented in `01-Design-and-Architecture.md` §C
-  "Obfuscated-id length ceiling") rather than requiring a schema change.
+  (see F-equivalent fix in `02-Implementation.sql`'s `obf_fn_generate_obfuscated_user_id`,
+  documented in `01-Design-and-Architecture.md` §C "Obfuscated-id length ceiling") rather
+  than requiring a schema change. (The cap was originally 49 characters; see
+  "UserID-is-not-an-email correction" below — it's now 34, an even less demanding
+  requirement.)
 - **33 triggers calling 10 stored procedures/functions that don't exist anywhere in
   `appiandev2`** (e.g. `DAP_Update_rpt_Clock`) — meaning any plain `UPDATE`/`INSERT` on
   11 core tables already failed in this lower-environment copy, independent of
@@ -511,3 +517,88 @@ None of these are framework bugs; they're documented here because the review pro
 surfaced them (systematically working through real error messages against real data,
 rather than only the synthetic fixture) is what makes this a legitimate second/third-pass
 review rather than a rubber stamp.
+
+---
+
+## UserID-is-not-an-email correction
+
+Fourth pass. The design and implementation both assumed `dap_User.UserID` **is** the
+user's email address. That's wrong: `UserID` is a stripped, local-part-shaped identifier
+*derived* from the real email (e.g. `Wendy.Boyce` for `Wendy.Boyce@sa.gov.au`) — no
+`@domain`. It still directly names a real person, so the obfuscation requirement is
+unchanged (it must still be fully replaced everywhere it's used as an identity key); only
+the *shape* of the replacement value was wrong, since it was built to look like an email
+(`<hash>@example.invalid`) when the original never had a domain to begin with.
+
+**Fix applied:**
+- `obf_fn_generate_obfuscated_email` renamed to `obf_fn_generate_obfuscated_user_id` and
+  its output changed from `<33-hex-char-hash>@example.invalid` (49 chars max) to
+  `<hash-segment>.<hash-segment>` (34 chars max) — a `Word.Word`-shaped token with no
+  `@domain` suffix, mirroring the real value's shape instead of a fabricated one. Same
+  SHA-256 basis, same ~132 bits of entropy, same collision-retry mechanics — only the
+  formatting changed.
+- `obf_sp_validate_reference_column_lengths`'s ceiling dropped from 50 to 34 characters
+  accordingly (a *less* demanding requirement on target-schema column widths than before).
+- The residual-PII spot check for `dap_User.UserID` in `obf_sp_validate_obfuscation` no
+  longer does a `NOT LIKE '%@example.invalid'` string-pattern match (meaningless once the
+  value has no domain) — it now checks the value against `obf_UserObfuscationMapping`
+  directly (`m.ObfuscatedUserID = t.UserID`), the same technique already used for every
+  *reference* column's check. This is actually more precise than the pattern it replaced.
+- Configured `EMAIL`-type columns (a genuine, separate real-email column elsewhere in the
+  schema, e.g. `dap_User.SecondaryEmail`) are untouched — that code path always was, and
+  still is, a true email generator with the `@example.invalid` domain; only the *UserID
+  identity-mapping* generator was misshapen.
+- `01-Design-and-Architecture.md`, `05-Runbook.md`, `03-Test-Plan.sql`, and
+  `test/run-all.sh` updated to match (renamed function, new length ceiling, and the two
+  places a test asserted on the now-nonexistent `@example.invalid` marker on
+  `dap_User.UserID` — TEST 12c's residual-PII fixture edit and TEST 19's per-target
+  "obfuscated" check — rewritten to check the mapping table instead).
+
+**Verified:** `bash test/run-all.sh` against a live MariaDB 12.3 container —
+**63/63 pass**, including the rewritten TEST 12c and TEST 19 assertions.
+
+---
+
+## Cross-schema collation bug (caught testing the above fix, unrelated to it)
+
+While re-verifying the correction above against a target schema pinned to
+`utf8mb4_general_ci` (the actual operator's environment, distinct from the throwaway
+schema this framework's own container had been using — which inherits the server's
+current default, `utf8mb4_uca1400_ai_ci` on MariaDB 10.10+/12.x), the orchestrator failed
+immediately:
+
+```
+ERROR 1267 (HY000): Illegal mix of collations (utf8mb4_uca1400_ai_ci,IMPLICIT) and
+(utf8mb4_general_ci,IMPLICIT) for operation '='
+```
+
+**Root cause.** `obf_admin`'s own string columns and generator functions take whichever
+collation was in effect when `02-Implementation.sql` was loaded (the server default, never
+pinned explicitly) — so any target schema on a *different* collation than that trips
+MariaDB's "illegal mix" check the moment `obf_UserObfuscationMapping` (or a `Synthetic*`
+pool table) is joined or compared against a target-schema column. This is every mapping
+join in the framework, not a corner case — `obf_sp_create_user_mapping`,
+`obf_sp_report_orphan_user_references`, `obf_sp_resolve_orphan_user_references`,
+`obf_sp_obfuscate_user_references`, `obf_sp_obfuscate_user_table`, and
+`obf_sp_validate_obfuscation`'s stray/residual checks all hit it, confirmed by stepping
+through each individually against the mismatched-collation reproduction.
+
+**Fix applied.** Every one of those comparisons now forces the target-schema side to an
+explicit `COLLATE utf8mb4_general_ci` (see "Cross-schema collation safety" in
+`01-Design-and-Architecture.md` §C for why this is safe and collation-direction-agnostic —
+it resolves correctly regardless of which side, or neither, was actually
+`utf8mb4_general_ci` to begin with, since every one of these comparisons already
+normalizes case via `LOWER()` or compares already-lowercase generated values). Stored
+function results (`obf_fn_synthetic_first_name` etc.) and built-in expressions
+(`SHA2(...)`, string literals) were checked too and confirmed **not** independently
+affected — a function/literal result has lower comparison precedence ("coercible") than an
+explicit table column, so it defers to the column's collation without error; the bug is
+specifically column-vs-column across the two schemas.
+
+**Verified:** added TEST 20 to `test/run-all.sh` / `03-Test-Plan.sql` — creates a target
+schema explicitly on `utf8mb4_general_ci`, runs the full orchestrator against it twice
+(success + idempotency), and checks the mapping table doesn't grow spurious rows. Also
+manually stepped through every affected sub-procedure individually against the same
+reproduction to isolate the fix before adding the automated test. Full suite —
+**66/66 pass** (63 prior + this new test's 3 assertions), against both a
+collation-matched and a deliberately collation-mismatched target.

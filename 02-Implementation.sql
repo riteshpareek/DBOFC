@@ -18,7 +18,12 @@
 --
 -- Assumes: this runs against the LOWER-ENVIRONMENT COPY only, after the
 --          production->lower copy has completed.
--- Assumes: dap_User.UserID *is* the email address (per spec section 1).
+-- Assumes: dap_User.UserID is NOT the user's email address -- it's a
+--          stripped, local-part-shaped identifier derived from it (e.g.
+--          "Wendy.Boyce" for Wendy.Boyce@sa.gov.au). It still directly
+--          names a real person, so it is obfuscated the same as any other
+--          PII (see obf_fn_generate_obfuscated_user_id); it is just not
+--          given an '@domain' suffix, since the original never had one.
 --          Adjust column names below if your actual schema differs.
 -- =====================================================================
 
@@ -223,40 +228,45 @@ BEGIN
     RETURN CONCAT(obf_admin.obf_fn_quote_identifier(p_schema), '.', obf_admin.obf_fn_quote_identifier(p_table));
 END$$
 
--- Deterministic, salted, collision-resistant obfuscated email generator.
--- p_local_part_len lets the caller fit the result to the real column's
+-- Deterministic, salted, collision-resistant obfuscated user id generator.
+-- dap_User.UserID is NOT an email address -- it's a stripped, local-part-
+-- shaped identifier derived from one (e.g. "Wendy.Boyce" for
+-- Wendy.Boyce@sa.gov.au), but it still directly names a real person, so it
+-- still needs full obfuscation. The replacement mirrors that same
+-- "Word.Word" shape (two dot-separated hash segments) with no '@domain'
+-- suffix -- the original value never had one either.
+-- p_max_len lets the caller fit the result to the real column's
 -- character_maximum_length (see obf_sp_create_user_mapping).
-CREATE OR REPLACE FUNCTION obf_admin.obf_fn_generate_obfuscated_email(
-    p_original_email  VARCHAR(255),
-    p_salt            VARCHAR(64),
-    p_attempt         INT,
-    p_local_part_len  INT
+CREATE OR REPLACE FUNCTION obf_admin.obf_fn_generate_obfuscated_user_id(
+    p_original_user_id  VARCHAR(255),
+    p_salt              VARCHAR(64),
+    p_attempt           INT,
+    p_max_len           INT
 )
 RETURNS VARCHAR(255)
 DETERMINISTIC
 BEGIN
-    DECLARE v_hash VARCHAR(64);
+    DECLARE v_hash  VARCHAR(64);
     DECLARE v_local VARCHAR(64);
+    DECLARE v_split INT;
 
     -- p_attempt only changes on a mapping-table unique-key collision retry
     -- (astronomically unlikely with SHA-256, but handled rather than assumed away).
-    SET v_hash = SHA2(CONCAT(p_salt, '|', LOWER(p_original_email), '|', p_attempt), 256);
+    SET v_hash = SHA2(CONCAT(p_salt, '|', LOWER(p_original_user_id), '|', p_attempt), 256);
 
-    IF p_local_part_len < 8 THEN
-        SET p_local_part_len = 8; -- floor to keep collision risk sane
+    IF p_max_len < 9 THEN
+        SET p_max_len = 9; -- floor: keeps collision risk sane and leaves room for the '.'
     END IF;
 
-    -- Ceiling of 33 caps the local part so the full email (33 + 16-char
-    -- '@example.invalid' domain = 49 chars max) never crosses 50 characters,
-    -- NO MATTER HOW WIDE dap_User.UserID is -- so it fits any reference
-    -- column at least 50 characters wide without a schema change. 33 hex
-    -- chars is still ~132 bits of hash entropy -- collision risk is
-    -- unaffected. obf_sp_validate_reference_column_lengths mirrors this same
-    -- 33-char (+17 for a 1-char safety margin) ceiling; keep the two in sync
-    -- if this ever changes.
-    SET v_local = LOWER(SUBSTRING(v_hash, 1, LEAST(p_local_part_len, 33)));
+    -- Cap at 33 hex chars of hash (~132 bits of entropy, unchanged from
+    -- before) NO MATTER HOW WIDE dap_User.UserID is, then split the result
+    -- around a '.' to mirror the real value's "Word.Word" shape.
+    -- obf_sp_validate_reference_column_lengths mirrors this same 33-char
+    -- (+1 for the '.') ceiling; keep the two in sync if this ever changes.
+    SET v_local = LOWER(SUBSTRING(v_hash, 1, LEAST(p_max_len, 33)));
+    SET v_split = CEIL(LENGTH(v_local) / 2);
 
-    RETURN CONCAT(v_local, '@example.invalid');
+    RETURN CONCAT(LEFT(v_local, v_split), '.', SUBSTRING(v_local, v_split + 1));
 END$$
 
 -- Deterministic synthetic FIRST name, keyed by the user's identity (not
@@ -517,7 +527,8 @@ BEGIN
          FROM obf_admin.obf_UserReferenceRegistry WHERE TargetSchema = p_target_schema AND Enabled = TRUE));
 
     -- 4c. Type-compatibility check. dap_User.UserID is assumed string-typed (it
-    -- holds the email, per the script header). A registered reference column
+    -- holds a stripped, email-derived identifier, per the script header). A
+    -- registered reference column
     -- that is numeric/temporal almost certainly is NOT a UserID copy —
     -- obfuscating it would corrupt it. Flag (WARN); the DBA should set
     -- Enabled=FALSE for any false positive, or fix the schema/discovery.
@@ -553,13 +564,13 @@ DELIMITER ;
 
 -- ---------------------------------------------------------------------
 -- 4d. obf_sp_validate_reference_column_lengths
---     obf_sp_obfuscate_user_references writes the SAME obfuscated-email
+--     obf_sp_obfuscate_user_references writes the SAME obfuscated user id
 --     value into every registered reference column that it writes into
 --     dap_User.UserID (no per-column truncation -- truncating differently
---     per column would let two different users' emails collide on a
---     narrow column). That value's max length is dictated by
+--     per column would let two different users' obfuscated ids collide on
+--     a narrow column). That value's max length is dictated by
 --     dap_User.UserID's own column width (see
---     obf_fn_generate_obfuscated_email / obf_sp_create_user_mapping). A
+--     obf_fn_generate_obfuscated_user_id / obf_sp_create_user_mapping). A
 --     narrower reference column can't hold it and the UPDATE fails with
 --     "Data too long for column" -- but only after
 --     obf_sp_drop_user_fk_constraints has already run. Catch it here,
@@ -582,11 +593,12 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'dap_User.UserID column not found.';
     END IF;
 
-    -- Same formula as obf_sp_create_user_mapping / obf_fn_generate_obfuscated_email,
-    -- including that function's 33-char local-part ceiling (-> 50 chars total,
-    -- regardless of how wide dap_User.UserID itself is). Keep in sync with it.
-    SET v_local_len = GREATEST(v_userid_len - 17, 8);
-    SET v_required_len = LEAST(v_local_len, 33) + 17;
+    -- Same formula as obf_sp_create_user_mapping / obf_fn_generate_obfuscated_user_id,
+    -- including that function's 33-char hash ceiling (-> 34 chars total with
+    -- the '.' separator, regardless of how wide dap_User.UserID itself is).
+    -- Keep in sync with it.
+    SET v_local_len = GREATEST(v_userid_len - 1, 8);
+    SET v_required_len = LEAST(v_local_len, 33) + 1;
 
     DROP TEMPORARY TABLE IF EXISTS obf_RefColumnLengthReport;
     CREATE TEMPORARY TABLE obf_RefColumnLengthReport (
@@ -655,8 +667,8 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'dap_User.UserID column not found.';
     END IF;
 
-    -- reserve room for '@example.invalid' (16 chars)
-    SET v_local_len = GREATEST(v_col_len - 17, 8);
+    -- reserve 1 char for the '.' separator between the two hash segments
+    SET v_local_len = GREATEST(v_col_len - 1, 8);
     SET v_target_tbl = obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User');
 
     -- OriginalUserID is stored LOWER()-cased so downstream reference joins can be
@@ -706,15 +718,15 @@ BEGIN
     SET v_mapping_where = CONCAT(
         'FROM ', v_target_tbl, ' u ',
         'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) COLLATE utf8mb4_general_ci ',
         'WHERE m.OriginalUserID IS NULL AND u.UserID IS NOT NULL ',
-        '  AND u.UserID NOT IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')'
+        '  AND u.UserID COLLATE utf8mb4_general_ci NOT IN (SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')'
     );
 
     SET v_sql = CONCAT(
         'INSERT IGNORE INTO obf_admin.obf_UserObfuscationMapping (TargetSchema, OriginalUserID, ObfuscatedUserID, CreatedDate) ',
         'SELECT ', QUOTE(p_target_schema), ', LOWER(u.UserID), ',
-               'obf_admin.obf_fn_generate_obfuscated_email(u.UserID, ', QUOTE(p_salt), ', 0, ', v_local_len, '), NOW() ',
+               'obf_admin.obf_fn_generate_obfuscated_user_id(u.UserID, ', QUOTE(p_salt), ', 0, ', v_local_len, '), NOW() ',
         v_mapping_where
     );
     SET @sql_stmt = v_sql;
@@ -734,7 +746,7 @@ BEGIN
             SET v_sql = CONCAT(
                 'INSERT IGNORE INTO obf_admin.obf_UserObfuscationMapping (TargetSchema, OriginalUserID, ObfuscatedUserID, CreatedDate) ',
                 'SELECT ', QUOTE(p_target_schema), ', LOWER(u.UserID), ',
-                       'obf_admin.obf_fn_generate_obfuscated_email(u.UserID, ', QUOTE(p_salt), ', ', v_attempt, ', ', v_local_len, '), NOW() ',
+                       'obf_admin.obf_fn_generate_obfuscated_user_id(u.UserID, ', QUOTE(p_salt), ', ', v_attempt, ', ', v_local_len, '), NOW() ',
                 v_mapping_where
             );
             SET @sql_stmt = v_sql;
@@ -821,9 +833,9 @@ BEGIN
                    't.', obf_admin.obf_fn_quote_identifier(v_column), ', COUNT(*) ',
             'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping mo ',
-              'ON mo.TargetSchema = ', QUOTE(p_target_schema), ' AND mo.OriginalUserID   = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') ',
+              'ON mo.TargetSchema = ', QUOTE(p_target_schema), ' AND mo.OriginalUserID   = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping mx ',
-              'ON mx.TargetSchema = ', QUOTE(p_target_schema), ' AND mx.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' ',
+              'ON mx.TargetSchema = ', QUOTE(p_target_schema), ' AND mx.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci ',
             'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
             '  AND mo.OriginalUserID IS NULL ',
             '  AND mx.ObfuscatedUserID IS NULL ',
@@ -879,7 +891,7 @@ BEGIN
     IF v_col_len IS NULL THEN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'dap_User.UserID column not found.';
     END IF;
-    SET v_local_len = GREATEST(v_col_len - 17, 8);
+    SET v_local_len = GREATEST(v_col_len - 1, 8);
 
     OPEN cur;
     read_loop: LOOP
@@ -899,9 +911,9 @@ BEGIN
                     'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                     'SET t.', obf_admin.obf_fn_quote_identifier(v_column), ' = NULL ',
                     'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
-                    '  AND LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') NOT IN ',
+                    '  AND LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci NOT IN ',
                          '(SELECT OriginalUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ') ',
-                    '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' NOT IN ',
+                    '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
                          '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ') ',
                     'LIMIT 50000');
                 SET @sql_stmt = v_sql;
@@ -922,14 +934,14 @@ BEGIN
             SET v_sql = CONCAT(
                 'INSERT IGNORE INTO obf_admin.obf_UserObfuscationMapping (TargetSchema, OriginalUserID, ObfuscatedUserID, CreatedDate) ',
                 'SELECT DISTINCT ', QUOTE(p_target_schema), ', LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), '), ',
-                       'obf_admin.obf_fn_generate_obfuscated_email(t.', obf_admin.obf_fn_quote_identifier(v_column), ', ',
+                       'obf_admin.obf_fn_generate_obfuscated_user_id(t.', obf_admin.obf_fn_quote_identifier(v_column), ', ',
                             QUOTE(p_salt), ', ', v_attempt, ', ', v_local_len, '), NOW() ',
                 'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                 'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') ',
+                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
                 'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
                 '  AND m.OriginalUserID IS NULL ',
-                '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' NOT IN ',
+                '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
                      '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')');
             SET @sql_stmt = v_sql;
             PREPARE stmt FROM @sql_stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
@@ -939,10 +951,10 @@ BEGIN
                   'SELECT DISTINCT t.', obf_admin.obf_fn_quote_identifier(v_column), ' AS v ',
                   'FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                   'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-                    'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') ',
+                    'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
                   'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL ',
                   '  AND m.OriginalUserID IS NULL ',
-                  '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' NOT IN ',
+                  '  AND t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci NOT IN ',
                        '(SELECT ObfuscatedUserID FROM obf_admin.obf_UserObfuscationMapping WHERE TargetSchema = ', QUOTE(p_target_schema), ')',
                 ') d');
             SET @sql_stmt = v_sql;
@@ -1129,9 +1141,9 @@ BEGIN
             SET v_sql = CONCAT(
                 'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
                 'JOIN obf_admin.obf_UserObfuscationMapping m ',
-                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') ',
+                  'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(t.', obf_admin.obf_fn_quote_identifier(v_column), ') COLLATE utf8mb4_general_ci ',
                 'SET t.', obf_admin.obf_fn_quote_identifier(v_column), ' = m.ObfuscatedUserID ',
-                'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' <> m.ObfuscatedUserID ',
+                'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID ',
                 'LIMIT ', p_batch_size
             );
             SET @sql_stmt = v_sql;
@@ -1164,9 +1176,9 @@ BEGIN
     SET v_sql = CONCAT(
         'UPDATE ', obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User'), ' u ',
         'JOIN obf_admin.obf_UserObfuscationMapping m ',
-          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.OriginalUserID = LOWER(u.UserID) COLLATE utf8mb4_general_ci ',
         'SET u.UserID = m.ObfuscatedUserID ',
-        'WHERE u.UserID <> m.ObfuscatedUserID'
+        'WHERE u.UserID COLLATE utf8mb4_general_ci <> m.ObfuscatedUserID'
     );
     SET @sql_stmt = v_sql;
     PREPARE stmt FROM @sql_stmt;
@@ -1497,7 +1509,7 @@ BEGIN
         SET v_sql = CONCAT(
             'SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t ',
             'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
-              'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' ',
+              'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci ',
             'WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND m.ObfuscatedUserID IS NULL'
         );
         SET @sql_stmt = v_sql;
@@ -1552,21 +1564,30 @@ BEGIN
     END IF;
 
     -- 10c. Residual-PII spot checks. Heuristic, not exhaustive: catches values
-    -- that plainly did not get obfuscated (an email/UserID without the
+    -- that plainly did not get obfuscated (a dap_User.UserID that isn't a
+    -- known ObfuscatedUserID; a configured EMAIL column without the
     -- @example.invalid marker; a name/address not drawn from the Synthetic*
     -- pool; a phone not in the generator's 04######## shape). It cannot detect
-    -- a residual value that happens to look like the synthetic domain, and it
+    -- a residual value that happens to coincide with an obfuscated one, and it
     -- says nothing about STATIC/HASH columns (no fixed shape to test).
+    --
+    -- dap_User.UserID is checked against the mapping table itself, not a
+    -- string pattern -- unlike a configured EMAIL column, its obfuscated
+    -- form (see obf_fn_generate_obfuscated_user_id) has no fixed marker like
+    -- '@example.invalid' to match against, since the original value never
+    -- had a domain either.
     SET v_sql = CONCAT(
-        'SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User'),
-        ' WHERE UserID IS NOT NULL AND UserID NOT LIKE ''%@example.invalid'''
+        'SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, 'dap_User'), ' t ',
+        'LEFT JOIN obf_admin.obf_UserObfuscationMapping m ',
+          'ON m.TargetSchema = ', QUOTE(p_target_schema), ' AND m.ObfuscatedUserID = t.UserID COLLATE utf8mb4_general_ci ',
+        'WHERE t.UserID IS NOT NULL AND m.ObfuscatedUserID IS NULL'
     );
     SET @sql_stmt = v_sql;
     PREPARE stmt FROM @sql_stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
     IF @cnt > 0 THEN
         SET v_residual = v_residual + @cnt;
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'ERROR',
-            CONCAT(@cnt, ' dap_User.UserID value(s) are not in the obfuscated form (missing @example.invalid).'));
+            CONCAT(@cnt, ' dap_User.UserID value(s) are not a known obfuscated user id.'));
     END IF;
 
     SET done = 0;
@@ -1584,17 +1605,17 @@ BEGIN
             WHEN 'FIRST_NAME' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticFirstName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ')');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticFirstName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci)');
             WHEN 'LAST_NAME' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticLastName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ')');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticLastName s WHERE s.NameValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci)');
             WHEN 'ADDRESS' THEN
                 -- ADDRESS is LEFT(synthetic, col_len), so match on equality OR prefix.
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table), ' t',
                     ' WHERE t.', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND NOT EXISTS (',
-                    'SELECT 1 FROM obf_admin.obf_SyntheticStreetAddress s WHERE s.AddressValue = t.', obf_admin.obf_fn_quote_identifier(v_column),
-                    ' OR s.AddressValue LIKE CONCAT(t.', obf_admin.obf_fn_quote_identifier(v_column), ', ''%''))');
+                    'SELECT 1 FROM obf_admin.obf_SyntheticStreetAddress s WHERE s.AddressValue = t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci',
+                    ' OR s.AddressValue LIKE CONCAT(t.', obf_admin.obf_fn_quote_identifier(v_column), ' COLLATE utf8mb4_general_ci, ''%''))');
             WHEN 'PHONE' THEN
                 SET v_sql = CONCAT('SELECT COUNT(*) INTO @cnt FROM ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table),
                     ' WHERE ', obf_admin.obf_fn_quote_identifier(v_column), ' IS NOT NULL AND ',
