@@ -119,6 +119,11 @@ INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName
 -- ---------------------------------------------------------------------
 -- Second batch — property/site address tables confirmed as PII-bearing
 -- (owner name/address, not council/government contact info).
+--
+-- dap_BuildingNotificationResponse_OrphanBackup originally had the same
+-- two columns configured here too, but the table itself was later
+-- dropped from AppianTrn (outside this framework's control); its config
+-- and registry rows were removed accordingly rather than left stale.
 -- ---------------------------------------------------------------------
 INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName, ObfuscationType, StaticValue) VALUES
   ('AppianTrn','dap_ContactAddress','StreetAddress','ADDRESS',NULL),
@@ -133,9 +138,6 @@ INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName
 
   ('AppianTrn','dap_BuildingNotificationResponse','BuilderAddress','ADDRESS',NULL),
   ('AppianTrn','dap_BuildingNotificationResponse','BuilderPhoneNumber','PHONE',NULL),
-
-  ('AppianTrn','dap_BuildingNotificationResponse_OrphanBackup','BuilderAddress','ADDRESS',NULL),
-  ('AppianTrn','dap_BuildingNotificationResponse_OrphanBackup','BuilderPhoneNumber','PHONE',NULL),
 
   ('AppianTrn','dap_ESP','BuildingOwnerAddress','ADDRESS',NULL),
   ('AppianTrn','dap_ESP','BuildingOwnerEmail','EMAIL',NULL);
