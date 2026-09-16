@@ -1759,15 +1759,39 @@ BEGIN
     -- to the BEFORE snapshot obf_sp_obfuscate_database took right after discovery.
     -- Skipped (not failed) when called standalone with a RunID that has no
     -- BEFORE snapshot.
+    -- A table registered in obf_ReportingSnapshotExclusion was deliberately
+    -- left out of the reporting-snapshot truncation because it's kept live by
+    -- its own triggers (e.g. dap_mv_InspectionDetails, synced from
+    -- dap_InspectionDetails) -- a row-count change on exactly that table
+    -- during the run is the expected, documented behaviour, not a leak or a
+    -- bug, so it's logged as SKIP rather than failing validation.
     IF EXISTS (SELECT 1 FROM obf_admin.obf_ObfuscationRowCountSnapshot WHERE RunID = p_run_id AND TargetSchema = p_target_schema AND Phase = 'BEFORE') THEN
         CALL obf_admin.obf_sp_snapshot_row_counts(p_target_schema, p_run_id, 'AFTER');
+
+        INSERT INTO obf_admin.obf_ObfuscationRunLog (RunID, TargetSchema, StepName, StepStatus, Message)
+        SELECT p_run_id, p_target_schema, 'obf_sp_validate_obfuscation', 'SKIP',
+               CONCAT('Row count changed: ', b.TableName, ' before=', b.RowsCounted, ' after=', a.RowsCounted,
+                      ' - table is registered in obf_ReportingSnapshotExclusion, change expected, not checked.')
+        FROM obf_admin.obf_ObfuscationRowCountSnapshot b
+        JOIN obf_admin.obf_ObfuscationRowCountSnapshot a
+          ON a.RunID = b.RunID AND a.TableName = b.TableName AND a.Phase = 'AFTER'
+        WHERE b.RunID = p_run_id AND b.TargetSchema = p_target_schema AND b.Phase = 'BEFORE'
+          AND a.RowsCounted <> b.RowsCounted
+          AND EXISTS (
+              SELECT 1 FROM obf_admin.obf_ReportingSnapshotExclusion e
+              WHERE e.TargetSchema = p_target_schema AND e.TableName = b.TableName
+          );
 
         SELECT COUNT(*) INTO v_rc_mismatch
         FROM obf_admin.obf_ObfuscationRowCountSnapshot b
         JOIN obf_admin.obf_ObfuscationRowCountSnapshot a
           ON a.RunID = b.RunID AND a.TableName = b.TableName AND a.Phase = 'AFTER'
         WHERE b.RunID = p_run_id AND b.TargetSchema = p_target_schema AND b.Phase = 'BEFORE'
-          AND a.RowsCounted <> b.RowsCounted;
+          AND a.RowsCounted <> b.RowsCounted
+          AND NOT EXISTS (
+              SELECT 1 FROM obf_admin.obf_ReportingSnapshotExclusion e
+              WHERE e.TargetSchema = p_target_schema AND e.TableName = b.TableName
+          );
 
         IF v_rc_mismatch > 0 THEN
             INSERT INTO obf_admin.obf_ObfuscationRunLog (RunID, TargetSchema, StepName, StepStatus, Message)
@@ -1778,12 +1802,16 @@ BEGIN
             JOIN obf_admin.obf_ObfuscationRowCountSnapshot a
               ON a.RunID = b.RunID AND a.TableName = b.TableName AND a.Phase = 'AFTER'
             WHERE b.RunID = p_run_id AND b.TargetSchema = p_target_schema AND b.Phase = 'BEFORE'
-              AND a.RowsCounted <> b.RowsCounted;
+              AND a.RowsCounted <> b.RowsCounted
+              AND NOT EXISTS (
+                  SELECT 1 FROM obf_admin.obf_ReportingSnapshotExclusion e
+                  WHERE e.TargetSchema = p_target_schema AND e.TableName = b.TableName
+              );
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'ERROR',
                 CONCAT(v_rc_mismatch, ' table(s) changed row count during obfuscation.'));
         ELSE
             CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'OK',
-                'Row-count reconciliation passed (no table gained or lost rows).');
+                'Row-count reconciliation passed (no unexpected table gained or lost rows).');
         END IF;
     ELSE
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_validate_obfuscation', 'SKIP',
