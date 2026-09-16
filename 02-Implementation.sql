@@ -411,6 +411,63 @@ END$$
 DELIMITER ;
 
 -- ---------------------------------------------------------------------
+-- 2b. obf_sp_truncate_deletion_history
+--     Deletion-audit tables (dapDel_*, casDel_*, payDel_*) capture a full
+--     JSON snapshot of every deleted row -- including whatever PII that
+--     row held -- via a DELETE trigger on their "live" counterpart table
+--     (e.g. dap_ApplicationAllocatedUser's deletion-sync trigger writes
+--     into dapDel_ApplicationAllocatedUser). That JSON blob is exactly
+--     the kind of embedded free-text PII this framework deliberately
+--     does not attempt to pattern-match and scrub (see "Data embedded in
+--     JSON/free-text columns" in 01-Design-and-Architecture.md §C) -- so
+--     rather than leave it silently unobfuscated, every such table is
+--     truncated before anything else runs. A lower environment has no
+--     legitimate need for production's deletion history, so this is a
+--     clean removal, not a workaround.
+--
+--     Runs before obf_sp_snapshot_row_counts('BEFORE') in the
+--     orchestrator, so these tables are simply never part of the
+--     BEFORE/AFTER row-count reconciliation baseline in the first place
+--     -- no special-casing needed there. Idempotent: a table with zero
+--     rows truncates to zero rows again on a re-run.
+-- ---------------------------------------------------------------------
+
+DELIMITER $$
+CREATE OR REPLACE PROCEDURE obf_admin.obf_sp_truncate_deletion_history(IN p_target_schema VARCHAR(128), IN p_run_id CHAR(36))
+BEGIN
+    DECLARE done INT DEFAULT 0;
+    DECLARE v_table VARCHAR(128);
+    DECLARE v_count INT DEFAULT 0;
+    DECLARE v_sql TEXT;
+
+    DECLARE cur CURSOR FOR
+        SELECT TABLE_NAME FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = p_target_schema AND TABLE_TYPE = 'BASE TABLE'
+          AND (
+                TABLE_NAME LIKE 'dapDel\_%' ESCAPE '\\'
+             OR TABLE_NAME LIKE 'casDel\_%' ESCAPE '\\'
+             OR TABLE_NAME LIKE 'payDel\_%' ESCAPE '\\'
+          );
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN cur;
+    read_loop: LOOP
+        FETCH cur INTO v_table;
+        IF done THEN LEAVE read_loop; END IF;
+
+        SET v_sql = CONCAT('TRUNCATE TABLE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table));
+        SET @sql_stmt = v_sql;
+        PREPARE stmt FROM @sql_stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+        SET v_count = v_count + 1;
+    END LOOP;
+    CLOSE cur;
+
+    CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_truncate_deletion_history', 'OK',
+        CONCAT(v_count, ' deletion-audit table(s) (dapDel_*/casDel_*/payDel_*) truncated.'));
+END$$
+DELIMITER ;
+
+-- ---------------------------------------------------------------------
 -- 3. obf_sp_validate_config
 --    Sanity-checks obf_ObfuscationConfig against live metadata before
 --    anything destructive happens.
@@ -1973,6 +2030,12 @@ BEGIN
                    '; FK constraints currently dropped: ', v_dangling_fk,
                    '). Every step is idempotent; the salt MUST match the interrupted run. See obf_sp_obfuscation_status().'));
     END IF;
+
+    CALL obf_admin.obf_sp_truncate_deletion_history(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_truncate_deletion_history', CURRENT_TIMESTAMP);
 
     CALL obf_admin.obf_sp_validate_config(p_target_schema, v_run_id);
 

@@ -458,6 +458,48 @@ FROM dap_User;
 -- EXPECT: still succeeds; dap_User state unchanged (idempotent); mapping row count still 3.
 
 -- ---------------------------------------------------------------------
+-- TEST 22: A configured PII column whose only seed candidate (a
+--   registered reference column) is NULLABLE must not silently skip rows
+--   where that column is NULL -- every generator function returns NULL
+--   for a NULL seed, and "<> generator(seed)" can never be TRUE against
+--   NULL, so such a row would otherwise never be touched, forever. The
+--   seed picker now always resolves the table's true PRIMARY KEY too and
+--   COALESCEs it in as a per-row fallback (see obf_sp_obfuscate_configured_columns).
+-- ---------------------------------------------------------------------
+-- (against the target schema)
+-- CREATE TABLE dap_NullSeedContact (id INT PRIMARY KEY AUTO_INCREMENT, CreatedUserID VARCHAR(255) NULL, FirstName VARCHAR(50));
+-- INSERT INTO dap_NullSeedContact (CreatedUserID, FirstName) VALUES ('john@test.com','John'), (NULL,'Jane');
+-- (against obf_admin)
+-- INSERT INTO obf_ObfuscationConfig (TargetSchema,TableName,ColumnName,ObfuscationType) VALUES (@target,'dap_NullSeedContact','FirstName','FIRST_NAME');
+-- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);
+-- EXPECT: BOTH rows now hold a synthetic FirstName -- 'Jane' (NULL seed) is
+--   no longer the real name, and neither is 'John' (real seed); no row is
+--   left NULL or untouched.
+
+-- ---------------------------------------------------------------------
+-- TEST 23: Deletion-audit tables (dapDel_*/casDel_*/payDel_*) -- populated
+--   by a DELETE trigger with a full JSON snapshot of the deleted row,
+--   PII included -- are truncated before anything else runs, rather than
+--   left with unscrubbed embedded PII. A lookalike table name that
+--   doesn't have the literal "Del_" (e.g. dapDeleteMeNot) must be left
+--   alone, and unrelated tables must be untouched.
+-- ---------------------------------------------------------------------
+-- (against the target schema)
+-- CREATE TABLE dapDel_Something (id INT, Entry JSON);
+-- INSERT INTO dapDel_Something VALUES (1, '{"name":"real person"}'), (2, '{"name":"another"}');
+-- CREATE TABLE casDel_Other (id INT, Entry JSON);
+-- INSERT INTO casDel_Other VALUES (1, '{"pii":"yes"}');
+-- CREATE TABLE payDel_Refund (id INT, Entry JSON);
+-- INSERT INTO payDel_Refund VALUES (1, '{"pii":"yes"}');
+-- CREATE TABLE dapDeleteMeNot (id INT); INSERT INTO dapDeleteMeNot VALUES (1);
+-- (against obf_admin)
+-- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);
+-- SELECT COUNT(*) FROM dapDel_Something;  -- EXPECT: 0
+-- SELECT COUNT(*) FROM casDel_Other;      -- EXPECT: 0
+-- SELECT COUNT(*) FROM payDel_Refund;     -- EXPECT: 0
+-- SELECT COUNT(*) FROM dapDeleteMeNot;    -- EXPECT: 1 (untouched -- no literal "Del_")
+
+-- ---------------------------------------------------------------------
 -- Review the full run history for a target at any point (run against obf_admin):
 -- ---------------------------------------------------------------------
 SELECT * FROM obf_ObfuscationRunLog WHERE TargetSchema = @target ORDER BY LogID;

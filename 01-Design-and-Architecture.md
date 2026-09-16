@@ -72,6 +72,12 @@ parameter (omitted below for readability — read each as `obf_admin.obf_sp_x(p_
 ```
 obf_sp_obfuscate_database(salt, batch, purge)    -- master orchestrator, single entry point
  │
+ ├─ obf_sp_truncate_deletion_history()        -- truncates every dapDel_*/casDel_*/payDel_*
+ │                                           table (deletion-audit tables holding a JSON
+ │                                           snapshot of each deleted row's PII) -- runs
+ │                                           before the BEFORE row-count snapshot, so these
+ │                                           tables are never part of that baseline
+ │
  ├─ obf_sp_validate_config()                 -- checks every configured column exists (fatal if
  │                                           not); flags configured columns under a UNIQUE
  │                                           index (fatal for STATIC on a sole-column unique
@@ -155,6 +161,11 @@ reference columns) lives in the target schema itself.
 
 ```
 Production Copy (already done, out of scope)
+        │
+        ▼
+Truncate deletion-audit tables (dapDel_*, casDel_*, payDel_*)
+   (each holds a JSON snapshot of every deleted row's PII, out of scope for
+    pattern-based scrubbing -- removed outright, before any row-count baseline)
         │
         ▼
 Validate obf_ObfuscationConfig against live schema
@@ -299,7 +310,7 @@ Known gap: if a naming-convention column's real datatype isn't the `dap_User.Use
 
 **Unexpected user references.** Because discovery is metadata-driven and re-run every execution (not a one-off manual list), a newly added column that follows convention or has an FK to `dap_User` is picked up automatically. `obf_sp_discover_user_references()` also emits a diagnostic result set the DBA can eyeball before the destructive steps run.
 
-**Data embedded in JSON/free-text columns.** Out of scope for pattern-matched free-text scanning (deliberately — regex-scrubbing free text is unreliable and easy to get wrong). These columns should be added explicitly to `obf_ObfuscationConfig` with an appropriate type (or a custom `STATIC` replacement) if known to contain PII; the design flags this as a manual-review item rather than pretending to solve it generically.
+**Data embedded in JSON/free-text columns.** Out of scope for pattern-matched free-text scanning (deliberately — regex-scrubbing free text is unreliable and easy to get wrong). These columns should be added explicitly to `obf_ObfuscationConfig` with an appropriate type (or a custom `STATIC` replacement) if known to contain PII; the design flags this as a manual-review item rather than pretending to solve it generically. One recurring real-world case gets a dedicated mechanism instead of a manual review each cycle: deletion-audit tables (`dapDel_*`/`casDel_*`/`payDel_*`) that a `DELETE` trigger populates with a full JSON snapshot of the deleted row — including whatever PII it held. `obf_sp_truncate_deletion_history()` truncates every such table outright, before anything else runs, rather than attempt to parse and scrub JSON.
 
 **Triggers / dependent routines.** Any trigger or stored routine that reads `dap_User.UserID` or PII columns during the `UPDATE` statements in this framework will fire normally against the new obfuscated values — the framework doesn't disable triggers. If a trigger has side effects that assume production-shaped data (e.g. sends an email), that should be disabled independently in the lower environment before running this framework; that's flagged as a pre-requisite, not handled here.
 

@@ -341,6 +341,24 @@ chk "22a NULL-seed row (Jane) no longer holds the real name" "$(q "SELECT COUNT(
 chk "22b real-seed row (John) also obfuscated" "$(q "SELECT COUNT(*) FROM dap_NullSeedContact WHERE FirstName='John';")" "0"
 chk "22c both rows drew a synthetic name (none left NULL/untouched)" "$(qa "SELECT COUNT(*) FROM ${DBOBF_DB}.dap_NullSeedContact d WHERE EXISTS(SELECT 1 FROM obf_SyntheticFirstName s WHERE s.NameValue=CONVERT(d.FirstName USING utf8mb4) COLLATE utf8mb4_general_ci);")" "2"
 
+echo "### TEST 23  deletion-audit tables (dapDel_*/casDel_*/payDel_*) are truncated, unrelated tables are not"
+reset
+q "CREATE TABLE dapDel_Something (id INT, Entry JSON);
+   INSERT INTO dapDel_Something VALUES (1, '{\"name\":\"real person\"}'), (2, '{\"name\":\"another\"}');
+   CREATE TABLE casDel_Other (id INT, Entry JSON);
+   INSERT INTO casDel_Other VALUES (1, '{\"pii\":\"yes\"}');
+   CREATE TABLE payDel_Refund (id INT, Entry JSON);
+   INSERT INTO payDel_Refund VALUES (1, '{\"pii\":\"yes\"}');
+   CREATE TABLE dapDeleteMeNot (id INT);
+   INSERT INTO dapDeleteMeNot VALUES (1);" >/dev/null
+qa "CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
+chk "23a dapDel_* truncated" "$(q "SELECT COUNT(*) FROM dapDel_Something;")" "0"
+chk "23b casDel_* truncated" "$(q "SELECT COUNT(*) FROM casDel_Other;")" "0"
+chk "23c payDel_* truncated" "$(q "SELECT COUNT(*) FROM payDel_Refund;")" "0"
+chk "23d lookalike table without literal 'Del_' is left alone" "$(q "SELECT COUNT(*) FROM dapDeleteMeNot;")" "1"
+chk "23e dap_User (unrelated) still has its 3 rows" "$(q "SELECT COUNT(*) FROM dap_User;")" "3"
+chk "23f truncation step logged" "$(qa "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB' AND StepName='obf_sp_truncate_deletion_history' AND StepStatus='OK';")" "1"
+
 echo
 echo "======================================"
 echo "  PASS: $pass   FAIL: $fail"

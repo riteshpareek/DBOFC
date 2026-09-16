@@ -448,6 +448,7 @@ Every call's **first argument is the target schema name.**
 |---|---|
 | `obf_admin.obf_sp_obfuscate_database(target, salt, batch, purge)` | the run (and any resume) |
 | `obf_admin.obf_sp_obfuscation_status(target)` | before/after a run; after a failure |
+| `obf_admin.obf_sp_truncate_deletion_history(target, UUID())` | standalone re-check that no dapDel_*/casDel_*/payDel_* table has data (the main run already does this first, every time) |
 | `obf_admin.obf_sp_validate_config(target, UUID())` | pre-flight, read-only |
 | `obf_admin.obf_sp_discover_user_references(target, UUID())` | pre-flight, read-only |
 | `obf_admin.obf_sp_validate_reference_column_lengths(target, UUID())` | pre-flight, read-only — after discovery |
