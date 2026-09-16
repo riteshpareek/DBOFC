@@ -156,6 +156,19 @@ INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName
 INSERT INTO obf_admin.obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason) VALUES
   ('AppianTrn','dap_mv_InspectionDetails','Kept continuously in sync by live AFTER INSERT/UPDATE/DELETE triggers on dap_InspectionDetails (see utils_drop_triggers.sql), not an inert snapshot dump -- handled like any other live table instead of truncated.');
 
+-- dap_rpt_EntityProcessModel / dap_rpt_EntityColumnProcessModelMap /
+-- dap_rpt_ref_EntityName form an FK chain among themselves
+-- (dap_rpt_EntityColumnProcessModelMap -> dap_rpt_EntityProcessModel,
+-- and others -> dap_rpt_ref_EntityName); obf_sp_truncate_reporting_snapshots
+-- truncates dap_rpt_* tables in no particular order, so TRUNCATE fails with
+-- "Cannot truncate a table referenced in a foreign key constraint" on
+-- whichever of these is still an FK target when its turn comes. Excluded
+-- until the truncation step accounts for FK ordering between dap_rpt_* tables.
+INSERT INTO obf_admin.obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason) VALUES
+  ('AppianTrn','dap_rpt_ref_EntityName','FK target of other dap_rpt_* tables -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.'),
+  ('AppianTrn','dap_rpt_EntityColumnProcessModelMap','FK target of another dap_rpt_* table -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.'),
+  ('AppianTrn','dap_rpt_EntityProcessModel','FK target of dap_rpt_EntityColumnProcessModelMap -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.');
+
 -- ---------------------------------------------------------------------
 -- dap_Actor — a real PII-bearing table (82k rows) that did not exist at
 -- initial scan time (created mid-refresh while fixing a broken trigger's

@@ -430,6 +430,33 @@ means you're on an older copy of `02-Implementation.sql`; reload it (step 2) and
 Should not recur on the current version for `utf8mb3` or `utf8mb4` targets in any
 collation (a target on a genuinely non-Unicode-compatible character set is out of scope).
 
+### `Row N was cut by group_concat()`
+
+Not a framework bug — a **target-schema trigger** fired by one of our reference-column
+`UPDATE`s (see runbook §0: triggers are not disabled and fire exactly as they would for any
+other `UPDATE`) has its own `GROUP_CONCAT()` with no explicit width limit, and the value it
+tried to build exceeded `group_concat_max_len` for that session. Normally MariaDB only warns
+on this (silently truncating); under `STRICT_TRANS_TABLES` it's promoted to a hard error,
+aborting the `UPDATE` mid-batch. A confirmed real-world case: AppianTrn's
+`trU_dp_cooAppBuWo_CooBuildingNameConcat` trigger on `dap_CooApplicableBuildingWork` calls
+`DAP_UpdateCachedBuildingWorkConcat`, which needs more than the default 1024-char cap for a
+`CertificateOfOccupancy` with many linked `BuildingWork` rows.
+
+The current version of `obf_sp_obfuscate_database` sets
+`SESSION group_concat_max_len = 16777216` (16 MB) at the very start of the run specifically
+to give headroom against this — if you hit this error anyway, you're most likely running an
+older copy of `02-Implementation.sql` that predates that fix; reload it (step 2) and resume
+with the **same salt**:
+
+```sql
+CALL obf_admin.obf_sp_obfuscate_database('AppianTrn', 'AppianTrnSalt', 50000, FALSE);
+```
+
+If it recurs even on the current version, some trigger's `GROUP_CONCAT()` needs more than 16
+MB for a single group — raise the constant further, or fix the underlying trigger to cap its
+own output (it likely truncates the final value anyway, e.g. via `LEFT(...)`, so capping the
+`GROUP_CONCAT()` itself with a `SEPARATOR`/row-count limit is usually safe).
+
 ---
 
 ## 12. Repeat refreshes & housekeeping

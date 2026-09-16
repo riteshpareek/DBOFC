@@ -2059,6 +2059,17 @@ BEGIN
         RESIGNAL;
     END;
 
+    -- Target-schema triggers fire on our UPDATEs same as any caller's (see
+    -- runbook Sec 0) and are outside our control. Some build long strings via
+    -- GROUP_CONCAT() with no explicit LIMIT on the number/width of grouped
+    -- rows; under STRICT_TRANS_TABLES, a GROUP_CONCAT() truncated by too small
+    -- a group_concat_max_len raises as a hard error (not just a warning),
+    -- aborting the whole UPDATE. Raise the floor for this session only so the
+    -- run's own reference-column UPDATEs never trip over an application
+    -- trigger's concatenation width (e.g. AppianTrn's
+    -- DAP_UpdateCachedBuildingWorkConcat, which can need >1024 chars).
+    SET SESSION group_concat_max_len = GREATEST(@@session.group_concat_max_len, 16777216);
+
     INSERT INTO obf_admin.obf_ObfuscationMilestone
     (TargetSchema, MilestoneName, LoggedAt)
     VALUES(p_target_schema, 'Started OBF', CURRENT_TIMESTAMP);
