@@ -89,6 +89,21 @@ CREATE TABLE IF NOT EXISTS obf_admin.obf_TableSeedOverride (
     PRIMARY KEY (TargetSchema, TableName)
 ) ENGINE=InnoDB;
 
+-- obf_sp_truncate_reporting_snapshots (below) truncates every dap_rpt_*/
+-- dap_mv_* table outright, since those are periodic rollups this
+-- framework's column-by-column config doesn't target. A table that must
+-- NOT get that treatment -- e.g. one kept continuously in sync by live
+-- triggers rather than sitting as an inert snapshot dump, so truncating
+-- it would just have it silently repopulate -- is registered here
+-- instead of being hardcoded into the procedure, so a DBA can add/remove
+-- exclusions per target without editing SQL.
+CREATE TABLE IF NOT EXISTS obf_admin.obf_ReportingSnapshotExclusion (
+    TargetSchema VARCHAR(128) NOT NULL,
+    TableName    VARCHAR(128) NOT NULL,
+    Reason       VARCHAR(255) NULL,
+    PRIMARY KEY (TargetSchema, TableName)
+) ENGINE=InnoDB;
+
 -- OriginalUserID / ObfuscatedUserID are pinned to COLLATE utf8mb4_general_ci
 -- -- the exact collation every cross-schema comparison against them forces
 -- at query time (see "Cross-schema collation safety" in
@@ -464,6 +479,66 @@ BEGIN
 
     CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_truncate_deletion_history', 'OK',
         CONCAT(v_count, ' deletion-audit table(s) (dapDel_*/casDel_*/payDel_*) truncated.'));
+END$$
+DELIMITER ;
+
+-- ---------------------------------------------------------------------
+-- 2c. obf_sp_truncate_reporting_snapshots
+--     dap_rpt_* (reporting snapshot) and dap_mv_* (materialized-view)
+--     tables are periodic rollups of live data rather than something this
+--     framework's pattern-based obfuscation config targets column-by-
+--     column (dap_rpt_* was already noted as deferred for this reason in
+--     06-AppianTrn-PII-Config.sql). Rather than leave whatever PII they've
+--     rolled up unscrubbed, every such table is truncated outright,
+--     mirroring obf_sp_truncate_deletion_history() above -- except any
+--     table registered in obf_ReportingSnapshotExclusion for this target
+--     (e.g. dap_mv_InspectionDetails, which is kept continuously in sync
+--     by live triggers on dap_InspectionDetails rather than sitting as an
+--     inert snapshot dump, so it is left to be handled like any other
+--     live table instead of truncated here -- see that table's seed row
+--     in 06-AppianTrn-PII-Config.sql).
+--
+--     Runs immediately after obf_sp_truncate_deletion_history(), still
+--     before obf_sp_snapshot_row_counts('BEFORE'), so these tables are
+--     never part of that reconciliation baseline either. Idempotent: a
+--     table with zero rows truncates to zero rows again on a re-run.
+-- ---------------------------------------------------------------------
+
+DELIMITER $$
+CREATE OR REPLACE PROCEDURE obf_admin.obf_sp_truncate_reporting_snapshots(IN p_target_schema VARCHAR(128), IN p_run_id CHAR(36))
+BEGIN
+    DECLARE done INT DEFAULT 0;
+    DECLARE v_table VARCHAR(128);
+    DECLARE v_count INT DEFAULT 0;
+    DECLARE v_sql TEXT;
+
+    DECLARE cur CURSOR FOR
+        SELECT t.TABLE_NAME FROM information_schema.TABLES t
+        WHERE t.TABLE_SCHEMA = p_target_schema AND t.TABLE_TYPE = 'BASE TABLE'
+          AND (
+                t.TABLE_NAME LIKE 'dap\_rpt\_%' ESCAPE '\\'
+             OR t.TABLE_NAME LIKE 'dap\_mv\_%' ESCAPE '\\'
+          )
+          AND NOT EXISTS (
+                SELECT 1 FROM obf_admin.obf_ReportingSnapshotExclusion e
+                WHERE e.TargetSchema = p_target_schema AND e.TableName = t.TABLE_NAME
+          );
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = 1;
+
+    OPEN cur;
+    read_loop: LOOP
+        FETCH cur INTO v_table;
+        IF done THEN LEAVE read_loop; END IF;
+
+        SET v_sql = CONCAT('TRUNCATE TABLE ', obf_admin.obf_fn_quote_qualified(p_target_schema, v_table));
+        SET @sql_stmt = v_sql;
+        PREPARE stmt FROM @sql_stmt; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+        SET v_count = v_count + 1;
+    END LOOP;
+    CLOSE cur;
+
+    CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_truncate_reporting_snapshots', 'OK',
+        CONCAT(v_count, ' reporting-snapshot table(s) (dap_rpt_*/dap_mv_*, minus obf_ReportingSnapshotExclusion) truncated.'));
 END$$
 DELIMITER ;
 
@@ -2036,6 +2111,12 @@ BEGIN
     INSERT INTO obf_admin.obf_ObfuscationMilestone
     (TargetSchema, MilestoneName, LoggedAt)
     VALUES(p_target_schema, 'obf_sp_truncate_deletion_history', CURRENT_TIMESTAMP);
+
+    CALL obf_admin.obf_sp_truncate_reporting_snapshots(p_target_schema, v_run_id);
+
+    INSERT INTO obf_admin.obf_ObfuscationMilestone
+    (TargetSchema, MilestoneName, LoggedAt)
+    VALUES(p_target_schema, 'obf_sp_truncate_reporting_snapshots', CURRENT_TIMESTAMP);
 
     CALL obf_admin.obf_sp_validate_config(p_target_schema, v_run_id);
 

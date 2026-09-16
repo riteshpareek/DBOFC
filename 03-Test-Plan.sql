@@ -500,6 +500,28 @@ FROM dap_User;
 -- SELECT COUNT(*) FROM dapDeleteMeNot;    -- EXPECT: 1 (untouched -- no literal "Del_")
 
 -- ---------------------------------------------------------------------
+-- TEST 24: Reporting/materialized-view tables (dap_rpt_*/dap_mv_*) are
+--   truncated before anything else runs, same as the deletion-audit
+--   tables in TEST 23 -- except a table registered in
+--   obf_ReportingSnapshotExclusion (e.g. dap_mv_InspectionDetails, which
+--   stays live via triggers), which must be left alone.
+-- ---------------------------------------------------------------------
+-- (against the target schema)
+-- CREATE TABLE dap_rpt_ApplicationSummary (id INT, OwnerName VARCHAR(100));
+-- INSERT INTO dap_rpt_ApplicationSummary VALUES (1, 'Real Person');
+-- CREATE TABLE dap_mv_ContactRollup (id INT, OwnerName VARCHAR(100));
+-- INSERT INTO dap_mv_ContactRollup VALUES (1, 'Real Person');
+-- CREATE TABLE dap_mv_InspectionDetails (id INT, OwnerName VARCHAR(100));
+-- INSERT INTO dap_mv_InspectionDetails VALUES (1, 'Real Person');
+-- (against obf_admin)
+-- INSERT INTO obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason)
+--   VALUES (@target, 'dap_mv_InspectionDetails', 'kept live by triggers -- test');
+-- CALL obf_admin.obf_sp_obfuscate_database(@target, 'test-salt-001', 10000, FALSE);
+-- SELECT COUNT(*) FROM dap_rpt_ApplicationSummary;  -- EXPECT: 0
+-- SELECT COUNT(*) FROM dap_mv_ContactRollup;        -- EXPECT: 0
+-- SELECT COUNT(*) FROM dap_mv_InspectionDetails;    -- EXPECT: 1 (excluded via obf_ReportingSnapshotExclusion)
+
+-- ---------------------------------------------------------------------
 -- Review the full run history for a target at any point (run against obf_admin):
 -- ---------------------------------------------------------------------
 SELECT * FROM obf_ObfuscationRunLog WHERE TargetSchema = @target ORDER BY LogID;

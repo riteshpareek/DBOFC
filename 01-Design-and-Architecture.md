@@ -78,6 +78,12 @@ obf_sp_obfuscate_database(salt, batch, purge)    -- master orchestrator, single 
  │                                           before the BEFORE row-count snapshot, so these
  │                                           tables are never part of that baseline
  │
+ ├─ obf_sp_truncate_reporting_snapshots()     -- truncates every dap_rpt_*/dap_mv_* reporting/
+ │                                           materialized-view table not listed in
+ │                                           obf_ReportingSnapshotExclusion (e.g. dap_mv_InspectionDetails,
+ │                                           kept live by triggers); also runs before the BEFORE
+ │                                           row-count snapshot
+ │
  ├─ obf_sp_validate_config()                 -- checks every configured column exists (fatal if
  │                                           not); flags configured columns under a UNIQUE
  │                                           index (fatal for STATIC on a sole-column unique
@@ -166,6 +172,12 @@ Production Copy (already done, out of scope)
 Truncate deletion-audit tables (dapDel_*, casDel_*, payDel_*)
    (each holds a JSON snapshot of every deleted row's PII, out of scope for
     pattern-based scrubbing -- removed outright, before any row-count baseline)
+        │
+        ▼
+Truncate reporting/materialized-view tables (dap_rpt_*, dap_mv_*)
+   (periodic rollups, not targeted column-by-column -- removed outright,
+    except tables listed in obf_ReportingSnapshotExclusion, e.g.
+    dap_mv_InspectionDetails, which stays live via triggers)
         │
         ▼
 Validate obf_ObfuscationConfig against live schema
@@ -310,7 +322,7 @@ Known gap: if a naming-convention column's real datatype isn't the `dap_User.Use
 
 **Unexpected user references.** Because discovery is metadata-driven and re-run every execution (not a one-off manual list), a newly added column that follows convention or has an FK to `dap_User` is picked up automatically. `obf_sp_discover_user_references()` also emits a diagnostic result set the DBA can eyeball before the destructive steps run.
 
-**Data embedded in JSON/free-text columns.** Out of scope for pattern-matched free-text scanning (deliberately — regex-scrubbing free text is unreliable and easy to get wrong). These columns should be added explicitly to `obf_ObfuscationConfig` with an appropriate type (or a custom `STATIC` replacement) if known to contain PII; the design flags this as a manual-review item rather than pretending to solve it generically. One recurring real-world case gets a dedicated mechanism instead of a manual review each cycle: deletion-audit tables (`dapDel_*`/`casDel_*`/`payDel_*`) that a `DELETE` trigger populates with a full JSON snapshot of the deleted row — including whatever PII it held. `obf_sp_truncate_deletion_history()` truncates every such table outright, before anything else runs, rather than attempt to parse and scrub JSON.
+**Data embedded in JSON/free-text columns.** Out of scope for pattern-matched free-text scanning (deliberately — regex-scrubbing free text is unreliable and easy to get wrong). These columns should be added explicitly to `obf_ObfuscationConfig` with an appropriate type (or a custom `STATIC` replacement) if known to contain PII; the design flags this as a manual-review item rather than pretending to solve it generically. One recurring real-world case gets a dedicated mechanism instead of a manual review each cycle: deletion-audit tables (`dapDel_*`/`casDel_*`/`payDel_*`) that a `DELETE` trigger populates with a full JSON snapshot of the deleted row — including whatever PII it held. `obf_sp_truncate_deletion_history()` truncates every such table outright, before anything else runs, rather than attempt to parse and scrub JSON. The same treatment applies to `dap_rpt_*`/`dap_mv_*` reporting and materialized-view tables — periodic rollups of live data that this framework's column-by-column config doesn't target either — via `obf_sp_truncate_reporting_snapshots()`. Unlike the deletion-audit tables, this family can have per-target exceptions: any table registered in `obf_ReportingSnapshotExclusion` (schema-qualified `TargetSchema`/`TableName`, with a free-text `Reason`) is skipped rather than truncated. `dap_mv_InspectionDetails` is seeded there in `06-AppianTrn-PII-Config.sql` because it stays continuously in sync via live triggers rather than sitting as an inert snapshot, so it is left to be handled like any other live table.
 
 **Triggers / dependent routines.** Any trigger or stored routine that reads `dap_User.UserID` or PII columns during the `UPDATE` statements in this framework will fire normally against the new obfuscated values — the framework doesn't disable triggers. If a trigger has side effects that assume production-shaped data (e.g. sends an email), that should be disabled independently in the lower environment before running this framework; that's flagged as a pre-requisite, not handled here.
 

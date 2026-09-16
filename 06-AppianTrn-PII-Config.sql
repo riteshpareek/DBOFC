@@ -146,8 +146,15 @@ INSERT INTO obf_admin.obf_ObfuscationConfig (TargetSchema, TableName, ColumnName
 -- personal PII of an individual, or council/government contact info):
 -- cmncouncildetail, luacouncildetail (council office address/email),
 -- dap_Location, lualocation, cmnplbaddress, dap_ChildTitleLocation,
--- pllocation, luaipospaymentadvice, cas_CodeAmendmentSpatial,
--- dap_rpt_* (reporting snapshot tables).
+-- pllocation, luaipospaymentadvice, cas_CodeAmendmentSpatial.
+--
+-- dap_rpt_* (reporting snapshot tables) and dap_mv_* (materialized-view
+-- tables) are no longer deferred here -- they're truncated outright by
+-- obf_sp_truncate_reporting_snapshots() instead of being config-scrubbed
+-- column-by-column. dap_mv_InspectionDetails is registered below as an
+-- exclusion from that truncation, since it's kept live by triggers.
+INSERT INTO obf_admin.obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason) VALUES
+  ('AppianTrn','dap_mv_InspectionDetails','Kept continuously in sync by live AFTER INSERT/UPDATE/DELETE triggers on dap_InspectionDetails (see utils_drop_triggers.sql), not an inert snapshot dump -- handled like any other live table instead of truncated.');
 
 -- ---------------------------------------------------------------------
 -- dap_Actor — a real PII-bearing table (82k rows) that did not exist at

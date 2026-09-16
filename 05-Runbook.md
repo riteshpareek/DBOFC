@@ -156,6 +156,15 @@ Without either a PK or an override row, the run logs a `SKIP` for that table's c
 columns and leaves them untouched — check `obf_admin.obf_ObfuscationRunLog` for `SKIP` rows
 naming a table if PII you configured doesn't appear to have changed after a run.
 
+**Excluding a table from reporting-snapshot truncation:** every `dap_rpt_*`/`dap_mv_*` table
+is truncated outright (see `obf_sp_truncate_reporting_snapshots` in
+01-Design-and-Architecture.md §A) unless registered here:
+```sql
+INSERT INTO obf_admin.obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason)
+  VALUES ('appiandev2', 'dap_mv_SomeLiveView', 'Kept in sync by live triggers, not an inert snapshot.');
+```
+Remove the row (or `DELETE` it) to resume truncating that table on future runs.
+
 ---
 
 ## 4. Pre-flight — read-only, no data changes
@@ -449,6 +458,7 @@ Every call's **first argument is the target schema name.**
 | `obf_admin.obf_sp_obfuscate_database(target, salt, batch, purge)` | the run (and any resume) |
 | `obf_admin.obf_sp_obfuscation_status(target)` | before/after a run; after a failure |
 | `obf_admin.obf_sp_truncate_deletion_history(target, UUID())` | standalone re-check that no dapDel_*/casDel_*/payDel_* table has data (the main run already does this first, every time) |
+| `obf_admin.obf_sp_truncate_reporting_snapshots(target, UUID())` | standalone re-check that no dap_rpt_*/dap_mv_* table (except those listed in `obf_ReportingSnapshotExclusion`) has data (the main run already does this first, every time) |
 | `obf_admin.obf_sp_validate_config(target, UUID())` | pre-flight, read-only |
 | `obf_admin.obf_sp_discover_user_references(target, UUID())` | pre-flight, read-only |
 | `obf_admin.obf_sp_validate_reference_column_lengths(target, UUID())` | pre-flight, read-only — after discovery |

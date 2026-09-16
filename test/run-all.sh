@@ -42,6 +42,7 @@ reset() {
 DELETE FROM obf_UserObfuscationMapping    WHERE TargetSchema='$DBOBF_DB';
 DELETE FROM obf_UserReferenceRegistry     WHERE TargetSchema='$DBOBF_DB';
 DELETE FROM obf_TableSeedOverride         WHERE TargetSchema='$DBOBF_DB';
+DELETE FROM obf_ReportingSnapshotExclusion WHERE TargetSchema='$DBOBF_DB';
 DELETE FROM obf_FkConstraintBackup        WHERE TargetSchema='$DBOBF_DB';
 DELETE FROM obf_ObfuscationRunLog         WHERE TargetSchema='$DBOBF_DB';
 DELETE FROM obf_ObfuscationConfig         WHERE TargetSchema='$DBOBF_DB';
@@ -358,6 +359,23 @@ chk "23c payDel_* truncated" "$(q "SELECT COUNT(*) FROM payDel_Refund;")" "0"
 chk "23d lookalike table without literal 'Del_' is left alone" "$(q "SELECT COUNT(*) FROM dapDeleteMeNot;")" "1"
 chk "23e dap_User (unrelated) still has its 3 rows" "$(q "SELECT COUNT(*) FROM dap_User;")" "3"
 chk "23f truncation step logged" "$(qa "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB' AND StepName='obf_sp_truncate_deletion_history' AND StepStatus='OK';")" "1"
+
+echo "### TEST 24  reporting/materialized-view tables (dap_rpt_*/dap_mv_*) are truncated, obf_ReportingSnapshotExclusion entries are not"
+reset
+q "CREATE TABLE dap_rpt_ApplicationSummary (id INT, OwnerName VARCHAR(100));
+   INSERT INTO dap_rpt_ApplicationSummary VALUES (1, 'Real Person');
+   CREATE TABLE dap_mv_ContactRollup (id INT, OwnerName VARCHAR(100));
+   INSERT INTO dap_mv_ContactRollup VALUES (1, 'Real Person');
+   CREATE TABLE dap_mv_InspectionDetails (id INT, OwnerName VARCHAR(100));
+   INSERT INTO dap_mv_InspectionDetails VALUES (1, 'Real Person');" >/dev/null
+qa "INSERT INTO obf_ReportingSnapshotExclusion (TargetSchema, TableName, Reason)
+      VALUES ('$DBOBF_DB','dap_mv_InspectionDetails','kept live by triggers -- test');
+   CALL obf_admin.obf_sp_obfuscate_database('$DBOBF_DB','test-salt-001',10000,FALSE);" >/dev/null
+chk "24a dap_rpt_* truncated" "$(q "SELECT COUNT(*) FROM dap_rpt_ApplicationSummary;")" "0"
+chk "24b dap_mv_* truncated" "$(q "SELECT COUNT(*) FROM dap_mv_ContactRollup;")" "0"
+chk "24c excluded table (dap_mv_InspectionDetails) left alone" "$(q "SELECT COUNT(*) FROM dap_mv_InspectionDetails;")" "1"
+chk "24d dap_User (unrelated) still has its 3 rows" "$(q "SELECT COUNT(*) FROM dap_User;")" "3"
+chk "24e truncation step logged" "$(qa "SELECT COUNT(*)>0 FROM obf_ObfuscationRunLog WHERE TargetSchema='$DBOBF_DB' AND StepName='obf_sp_truncate_reporting_snapshots' AND StepStatus='OK';")" "1"
 
 echo
 echo "======================================"
