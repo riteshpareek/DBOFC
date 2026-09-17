@@ -457,6 +457,17 @@ MB for a single group — raise the constant further, or fix the underlying trig
 own output (it likely truncates the final value anyway, e.g. via `LEFT(...)`, so capping the
 `GROUP_CONCAT()` itself with a `SEPARATOR`/row-count limit is usually safe).
 
+**Known intermittent recurrence on the current version:** on AppianTrn this has still been
+observed to fire occasionally (roughly 1 in 3-4 fresh runs in testing) even with the 16 MB
+session override confirmed to be correctly in effect at the exact failing statement
+(verified with temporary logging of `@@session.group_concat_max_len` immediately before the
+`dap_CooApplicableBuildingWork` update — it read 16777216 on every run checked, including
+runs immediately following a failure). It isn't tied to fresh vs. resume, doesn't reproduce
+on demand, and every observed failure resolved on an immediate resume with the same salt. Most
+consistent with a low-frequency environmental hiccup in the sandbox (e.g. resource contention
+during the batched `UPDATE` that fires the trigger) rather than a logic bug in the fix itself.
+If you hit it, just resume — no other action has been needed so far.
+
 ---
 
 ## 12. Repeat refreshes & housekeeping
