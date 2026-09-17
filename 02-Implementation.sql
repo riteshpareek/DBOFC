@@ -1324,6 +1324,8 @@ BEGIN
     DECLARE v_column VARCHAR(128);
     DECLARE v_sql TEXT;
     DECLARE v_rows_affected BIGINT;
+    DECLARE v_retry INT;
+    DECLARE v_max_retries INT DEFAULT 3;
 
     DECLARE cur CURSOR FOR
         SELECT TableName, ColumnName FROM obf_admin.obf_UserReferenceRegistry
@@ -1354,10 +1356,40 @@ BEGIN
                 'LIMIT ', p_batch_size
             );
             SET @sql_stmt = v_sql;
-            PREPARE stmt FROM @sql_stmt;
-            EXECUTE stmt;
-            SET v_rows_affected = ROW_COUNT();
-            DEALLOCATE PREPARE stmt;
+            SET v_retry = 0;
+
+            -- A target-schema trigger firing on this UPDATE (see runbook Sec 0)
+            -- can hit error 1260 (GROUP_CONCAT() truncated -- promoted from a
+            -- warning to a hard error under STRICT_TRANS_TABLES). Observed
+            -- intermittently even with the 16MB group_concat_max_len headroom
+            -- set at the top of obf_sp_obfuscate_database (see Runbook Sec 11).
+            -- The target tables are InnoDB, so a failed UPDATE statement is
+            -- rolled back atomically by the engine -- retrying the identical
+            -- statement is safe and matches how a manual resume already
+            -- recovers from this.
+            retry_loop: LOOP
+                BEGIN
+                    DECLARE EXIT HANDLER FOR 1260
+                    BEGIN
+                        SET v_retry = v_retry + 1;
+                        IF v_retry > v_max_retries THEN
+                            CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_obfuscate_user_references', 'ERROR',
+                                CONCAT(v_table, '.', v_column, ' - a target-schema trigger truncated a GROUP_CONCAT() (error 1260) on ',
+                                       v_max_retries, ' consecutive attempts; giving up.'));
+                            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'GROUP_CONCAT() truncation in a target-schema trigger persisted after retries.';
+                        END IF;
+                        CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_obfuscate_user_references', 'WARN',
+                            CONCAT(v_table, '.', v_column, ' - retrying after a target-schema trigger truncated a GROUP_CONCAT() (attempt ', v_retry, ' of ', v_max_retries, ').'));
+                        DO SLEEP(0.5);
+                    END;
+
+                    PREPARE stmt FROM @sql_stmt;
+                    EXECUTE stmt;
+                    SET v_rows_affected = ROW_COUNT();
+                    DEALLOCATE PREPARE stmt;
+                    LEAVE retry_loop;
+                END;
+            END LOOP retry_loop;
         END WHILE;
 
         CALL obf_admin.obf_sp_log_step(p_target_schema, p_run_id, 'obf_sp_obfuscate_user_references', 'OK',

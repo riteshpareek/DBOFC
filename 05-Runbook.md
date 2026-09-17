@@ -457,16 +457,26 @@ MB for a single group — raise the constant further, or fix the underlying trig
 own output (it likely truncates the final value anyway, e.g. via `LEFT(...)`, so capping the
 `GROUP_CONCAT()` itself with a `SEPARATOR`/row-count limit is usually safe).
 
-**Known intermittent recurrence on the current version:** on AppianTrn this has still been
-observed to fire occasionally (roughly 1 in 3-4 fresh runs in testing) even with the 16 MB
-session override confirmed to be correctly in effect at the exact failing statement
-(verified with temporary logging of `@@session.group_concat_max_len` immediately before the
-`dap_CooApplicableBuildingWork` update — it read 16777216 on every run checked, including
-runs immediately following a failure). It isn't tied to fresh vs. resume, doesn't reproduce
-on demand, and every observed failure resolved on an immediate resume with the same salt. Most
-consistent with a low-frequency environmental hiccup in the sandbox (e.g. resource contention
-during the batched `UPDATE` that fires the trigger) rather than a logic bug in the fix itself.
-If you hit it, just resume — no other action has been needed so far.
+**Known intermittent recurrence, now handled automatically:** on AppianTrn this was observed
+to fire occasionally (roughly 1 in 3-4 fresh runs in testing) even with the 16 MB session
+override confirmed to be correctly in effect at the exact failing statement (verified with
+temporary logging of `@@session.group_concat_max_len` immediately before the
+`dap_CooApplicableBuildingWork` update — it read 16777216 on every run checked, including runs
+immediately following a failure). It wasn't tied to fresh vs. resume and didn't reproduce on
+demand — most consistent with a low-frequency environmental hiccup in the sandbox (e.g.
+resource contention during the batched `UPDATE` that fires the trigger) rather than a logic
+bug in the group_concat_max_len fix itself.
+
+Since every observed occurrence resolved cleanly on an immediate resume with the same salt —
+and the target tables are InnoDB, so a failed `UPDATE` statement is rolled back atomically,
+making an identical retry safe — `obf_sp_obfuscate_user_references` now catches MySQL error
+**1260** (`Row N was cut by group_concat()`, whether reported as a warning or, under strict
+mode, a hard error) and automatically retries the same batch up to 3 times with a short pause,
+logging a `WARN` per retry. A manual resume (as described above) is now only needed if a
+single batch fails **4 times in a row** — at that point it's logged as an `ERROR` and the run
+stops, same as before. If you see repeated retry `WARN`s in `obf_ObfuscationRunLog` for the
+same table.column across many runs, that's worth investigating as a real, not transient,
+problem.
 
 ---
 
