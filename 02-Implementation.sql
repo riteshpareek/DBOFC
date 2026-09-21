@@ -640,13 +640,17 @@ BEGIN
     CLOSE cur_uq;
 
     -- Diagnostic result set: every configured column that shares a unique index.
-    SELECT oc.TableName, oc.ColumnName, oc.ObfuscationType, s.INDEX_NAME AS UniqueIndex
-    FROM obf_admin.obf_ObfuscationConfig oc
-    JOIN information_schema.STATISTICS s
-      ON s.TABLE_SCHEMA = p_target_schema AND s.TABLE_NAME = oc.TableName
-     AND s.COLUMN_NAME = oc.ColumnName AND s.NON_UNIQUE = 0
-    WHERE oc.TargetSchema = p_target_schema AND oc.Enabled = TRUE
-    ORDER BY oc.TableName, oc.ColumnName, s.INDEX_NAME;
+    -- Suppressed while obf_sp_obfuscate_database runs (@obf_suppress_result_sets):
+    -- web clients such as phpMyAdmin can't take extra result sets from a CALL.
+    IF IFNULL(@obf_suppress_result_sets, 0) = 0 THEN
+        SELECT oc.TableName, oc.ColumnName, oc.ObfuscationType, s.INDEX_NAME AS UniqueIndex
+        FROM obf_admin.obf_ObfuscationConfig oc
+        JOIN information_schema.STATISTICS s
+          ON s.TABLE_SCHEMA = p_target_schema AND s.TABLE_NAME = oc.TableName
+         AND s.COLUMN_NAME = oc.ColumnName AND s.NON_UNIQUE = 0
+        WHERE oc.TargetSchema = p_target_schema AND oc.Enabled = TRUE
+        ORDER BY oc.TableName, oc.ColumnName, s.INDEX_NAME;
+    END IF;
 
     IF v_fatal > 0 THEN
         SIGNAL SQLSTATE '45000'
@@ -757,15 +761,18 @@ BEGIN
     END IF;
 
     -- Diagnostic result set for a human to eyeball before destructive steps run.
-    SELECT r.RegistryID, r.TableName, r.ColumnName, r.DiscoveryMethod, r.ConstraintName,
-           r.OrphanAction, c.DATA_TYPE AS ColumnDataType,
-           (c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext','enum','set')
-            OR @dbobf_userid_type NOT IN ('varchar','char','text','tinytext','mediumtext','longtext')) AS TypeLooksCompatible
-    FROM obf_admin.obf_UserReferenceRegistry r
-    LEFT JOIN information_schema.COLUMNS c
-      ON c.TABLE_SCHEMA = p_target_schema AND c.TABLE_NAME = r.TableName AND c.COLUMN_NAME = r.ColumnName
-    WHERE r.TargetSchema = p_target_schema AND r.Enabled = TRUE
-    ORDER BY r.DiscoveryMethod, r.TableName, r.ColumnName;
+    -- (Suppressed during obf_sp_obfuscate_database; query obf_UserReferenceRegistry instead.)
+    IF IFNULL(@obf_suppress_result_sets, 0) = 0 THEN
+        SELECT r.RegistryID, r.TableName, r.ColumnName, r.DiscoveryMethod, r.ConstraintName,
+               r.OrphanAction, c.DATA_TYPE AS ColumnDataType,
+               (c.DATA_TYPE IN ('varchar','char','text','tinytext','mediumtext','longtext','enum','set')
+                OR @dbobf_userid_type NOT IN ('varchar','char','text','tinytext','mediumtext','longtext')) AS TypeLooksCompatible
+        FROM obf_admin.obf_UserReferenceRegistry r
+        LEFT JOIN information_schema.COLUMNS c
+          ON c.TABLE_SCHEMA = p_target_schema AND c.TABLE_NAME = r.TableName AND c.COLUMN_NAME = r.ColumnName
+        WHERE r.TargetSchema = p_target_schema AND r.Enabled = TRUE
+        ORDER BY r.DiscoveryMethod, r.TableName, r.ColumnName;
+    END IF;
 END$$
 DELIMITER ;
 
@@ -835,7 +842,9 @@ BEGIN
                       'or use a narrower dap_User.UserID before running.')
         FROM obf_RefColumnLengthReport;
 
-        SELECT * FROM obf_RefColumnLengthReport ORDER BY TableName, ColumnName;
+        IF IFNULL(@obf_suppress_result_sets, 0) = 0 THEN
+            SELECT * FROM obf_RefColumnLengthReport ORDER BY TableName, ColumnName;
+        END IF;
 
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'One or more user-reference columns are too narrow to hold the obfuscated user id -- see obf_ObfuscationRunLog.';
@@ -1066,7 +1075,9 @@ BEGIN
             'No unhandled orphan user-reference values.');
     END IF;
 
-    SELECT * FROM obf_OrphanUserRefReport ORDER BY TableName, ColumnName, OrphanValue;
+    IF IFNULL(@obf_suppress_result_sets, 0) = 0 THEN
+        SELECT * FROM obf_OrphanUserRefReport ORDER BY TableName, ColumnName, OrphanValue;
+    END IF;
 END$$
 DELIMITER ;
 
@@ -2116,8 +2127,17 @@ BEGIN
         CALL obf_admin.obf_sp_log_step(p_target_schema, v_run_id, 'obf_sp_obfuscate_database', 'ERROR',
             CONCAT('Run FAILED (', v_sqlstate, '): ', LEFT(v_msg, 380),
                    ' -- schema may be partly migrated; fix the cause and re-run with the SAME salt to resume.'));
+        SET @obf_suppress_result_sets = 0;
         RESIGNAL;
     END;
+
+    -- Diagnostic result sets from the steps below are suppressed for the
+    -- duration of the run: web SQL clients (phpMyAdmin) can't take more than
+    -- one result set from a CALL and drop the connection ("Got an error
+    -- writing communication packets", 08S01), which fails the run. The same
+    -- data is in obf_UserReferenceRegistry / obf_OrphanUserRefReport /
+    -- obf_RefColumnLengthReport and obf_ObfuscationRunLog.
+    SET @obf_suppress_result_sets = 1;
 
     -- Target-schema triggers fire on our UPDATEs same as any caller's (see
     -- runbook Sec 0) and are outside our control. Some build long strings via
@@ -2295,6 +2315,7 @@ BEGIN
     (TargetSchema, MilestoneName, LoggedAt)
     VALUES(p_target_schema, 'obf_sp_log_step', CURRENT_TIMESTAMP);
 
+    SET @obf_suppress_result_sets = 0;
     SELECT v_run_id AS RunID;
 END$$
 DELIMITER ;
