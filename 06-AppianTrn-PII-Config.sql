@@ -270,3 +270,78 @@ INSERT INTO obf_admin.obf_ReportingSnapshotExclusion (TargetSchema, TableName, R
   (@TargetSchema,'dap_rpt_ref_EntityName','FK target of other dap_rpt_* tables -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.'),
   (@TargetSchema,'dap_rpt_EntityColumnProcessModelMap','FK target of another dap_rpt_* table -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.'),
   (@TargetSchema,'dap_rpt_EntityProcessModel','FK target of dap_rpt_EntityColumnProcessModelMap -- TRUNCATE fails on the FK chain; excluded until truncation handles FK ordering between dap_rpt_* tables.');
+
+-- ======================================================================
+-- obf_UserReferenceRegistry — manually-identified user-reference columns
+--
+-- obf_sp_discover_user_references only finds columns via a real FK to
+-- dap_User, or a name matching its naming-convention list (CreatedBy,
+-- CreatedUserID, ModifiedUserID, etc.) -- see 02-Implementation.sql
+-- Section 4. These columns hold a dap_User.UserID-shaped value under a
+-- name the naming-convention scan doesn't match (AssessorUserID typo'd
+-- as AsssessorUserID, plain UserId/UserID with no prefix, memberuser /
+-- manageruser, username, ReviewerUserID, AllocatedUser, etc.), found by
+-- a manual pass over the schema. All verified to exist in AppianTrn and
+-- be string-typed (matching dap_User.UserID's shape) before being added
+-- here. DiscoveryMethod='MANUAL' distinguishes them in
+-- obf_UserReferenceRegistry from FK/NAMING_CONVENTION rows.
+--
+-- Registering a column here does NOT itself validate an orphan/data
+-- issue -- run obf_sp_report_orphan_user_references (Runbook Sec 5)
+-- after loading this before a real run, same as any newly-discovered
+-- reference column.
+-- ======================================================================
+INSERT INTO obf_admin.obf_UserReferenceRegistry (TargetSchema, TableName, ColumnName, DiscoveryMethod) VALUES
+  (@TargetSchema,'acp_Assessment','AsssessorUserID','MANUAL'),
+  (@TargetSchema,'acp_Audit','UserId','MANUAL'),
+  (@TargetSchema,'acp_Decision','DelegatorUserID','MANUAL'),
+  (@TargetSchema,'acp_Document','UploadedByUserId','MANUAL'),
+  (@TargetSchema,'acp_PublicDisplayDetails','UserId','MANUAL'),
+  (@TargetSchema,'cas_CodeAmendmentAudit','UserID','MANUAL'),
+  (@TargetSchema,'cas_ProcessOrchestrationMetadata','SingletonUserId','MANUAL'),
+  (@TargetSchema,'cas_Stage','AllocatedUser','MANUAL'),
+  (@TargetSchema,'cmnteammembers','memberuser','MANUAL'),
+  (@TargetSchema,'cmnteams','manageruser','MANUAL'),
+  (@TargetSchema,'dap_ApplicationContactsAuditHistory','UserID','MANUAL'),
+  (@TargetSchema,'dap_ApplicationDocumentStaging','ReviewerUserID','MANUAL'),
+  (@TargetSchema,'dap_AuditHistory','UserID','MANUAL'),
+  (@TargetSchema,'dap_BuildingNotification','AcknowledgedUserId','MANUAL'),
+  (@TargetSchema,'dap_CertificateOfOccupancy','AssignedToUser','MANUAL'),
+  (@TargetSchema,'dap_ConcurrenceEndorsement','NominatedUserID','MANUAL'),
+  (@TargetSchema,'dap_ConcurrenceEndorsement','RequestorUserID','MANUAL'),
+  (@TargetSchema,'dap_ConcurrenceResponses','NominatedDelegateUserID','MANUAL'),
+  (@TargetSchema,'dap_ConcurrenceResponses','RequestorUserID','MANUAL'),
+  (@TargetSchema,'dap_ConsentDecision','RespondeeUserId','MANUAL'),
+  (@TargetSchema,'dap_Invoice','ExternalProcessedUser','MANUAL'),
+  (@TargetSchema,'dap_MAP_Crown_Application_ApplicantType','LastModifiedByUserID','MANUAL'),
+  (@TargetSchema,'dap_Refund','AssessmentOfficerUserID','MANUAL'),
+  (@TargetSchema,'dap_Refund','ExtRefundUserId','MANUAL'),
+  (@TargetSchema,'dap_Refund','FinancialApproverUserID','MANUAL'),
+  (@TargetSchema,'dap_Response','RespondentUserID','MANUAL'),
+  (@TargetSchema,'dap_UserMangementAuditHistory','ReferenceUserId','MANUAL'),
+  (@TargetSchema,'dap_UserMangementAuditHistory','UserId','MANUAL'),
+  (@TargetSchema,'luacouncildetail','username','MANUAL'),
+  (@TargetSchema,'luareferralagency','username','MANUAL'),
+  (@TargetSchema,'pay_Audit','AuditUserID','MANUAL'),
+  (@TargetSchema,'pay_InvoicePayment','EFTSystemUser','MANUAL'),
+  (@TargetSchema,'pgwy_Payment_Interaction','UserId','MANUAL')
+ON DUPLICATE KEY UPDATE DiscoveryMethod = DiscoveryMethod;
+
+-- Already registered (via FK or NAMING_CONVENTION) and NOT re-inserted here --
+-- present for reference, since they appeared in the same manual audit pass:
+-- acp_ProfessionalAccreditation.UserID, cas_MAP_User_Partner.UserID,
+-- cas_ProponentAccess.UserID, cas_Referral.AllocatedUserId,
+-- cas_StageSubmission.VerifiedByUserId, cas_Task.AssignedToUserID,
+-- cas_UserManagementAudit.UserID, dap_ApplicantTask.AssignedUserID,
+-- dap_ApplicationAccess.UserID, dap_ApplicationAllocatedUser.AllocatedUserID,
+-- dap_APPortalFeeDetail.RelevantAuthorityACPUserID, dap_APPortalFeeItem.UserID,
+-- dap_BuildingNotificationResponse.ActivityDateUpdateUserID,
+-- dap_Consent.RelevantAuthorityACPUserId, dap_ConsentDecision.NextNominatedAOUserId,
+-- dap_ConsentDecision.NominatedUserID, dap_ConsentDecision.RequesterUserID,
+-- dap_CrownBuildingCertificate.BuildingCertifierACPUserId,
+-- dap_CrownCertificateOfOccupancy.IssuerACPUserId,
+-- dap_DevApprovalConsistent.RequesterUserID, dap_DevApprovalConsistent.RespondeeUserId,
+-- dap_Distribution.DistributedByUserID,
+-- dap_LandDivisionCertificateConsistent.RequesterUserID,
+-- dap_LandDivisionCertificateConsistent.RespondeeUserId,
+-- dap_MAP_User_ProfessionalAccreditation.UserID, dap_UserPartner.UserID.
